@@ -39,6 +39,23 @@ def test_parse_photos_rich_entries():
     assert server._parse_title(SAMPLE_PAGE) == "Family & Friends"
 
 
+def test_parse_photos_rich_entries_2026_nested_arrays():
+    # Mid-2026 page shape: nested arrays inside the media descriptor,
+    # verbatim structure from a real share page.
+    page = (
+        '[["AF1QipPY5sWHzRcBbIjsO4oAJveQm2AFvxA8o_sbf2Jo",'
+        '["https://lh3.googleusercontent.com/pw/AP1GczN3REph",4032,2268,'
+        "null,null,null,null,null,[null,null,1],[9073751]],"
+        '1735427730483,"T1TGVJ9_fE_p-Bv0MvMfSVrnW-Q",39600000]]'
+    )
+    photos = server._parse_photos(page)
+    assert len(photos) == 1
+    assert photos[0]["id"] == "AF1QipPY5sWHzRcBbIjsO4oAJveQm2AFvxA8o_sbf2Jo"
+    assert photos[0]["width"] == 4032
+    assert photos[0]["height"] == 2268
+    assert photos[0]["taken_ms"] == 1735427730483
+
+
 def test_parse_photos_fallback_urls_only():
     page = '["https://lh3.googleusercontent.com/pw/CCCC",800,600,'
     photos = server._parse_photos(page)

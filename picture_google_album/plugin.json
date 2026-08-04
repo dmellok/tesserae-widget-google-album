@@ -1,8 +1,13 @@
 {
   "tesserae_compat": "1.x",
   "name": "Picture, Google Shared Album",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "kind": "widget",
+  "requires": [
+    "network:photos.app.goo.gl",
+    "network:photos.google.com",
+    "network:lh3.googleusercontent.com"
+  ],
   "description": "Rotates through photos in a Google Photos album shared by link, full bleed. In Google Photos: open the album, Share, 'Create link', then paste the link (https://photos.app.goo.gl/…). Reads the public share page directly, no Google account or API key needed.",
   "icon": "ph-google-photos-logo",
   "supports": { "sizes": ["sm", "md", "lg"] },

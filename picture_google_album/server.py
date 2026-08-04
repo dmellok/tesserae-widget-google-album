@@ -34,16 +34,21 @@ HTTP_TIMEOUT_S = 20
 MANIFEST_TTL_S = 6 * 3600
 DISPLAY_BOX = 2048  # longest edge requested from lh3 for rendering
 MIN_DIM = 128  # skip avatars / tiny thumbs that share the blob
+# NOTE: must NOT claim Macintosh — photos.app.goo.gl serves a JS-only
+# Firebase Dynamic Links interstitial (no 302, no photos) to Mac desktop
+# UAs, while Windows/Linux UAs get a clean server-side redirect.
 USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
+    "Chrome/138.0.0.0 Safari/537.36"
 )
 
-# Rich entry: ["AF1Qip<id>",["https://lh3.../pw/<blob>",W,H,...],<epoch_ms>,...
+# Rich entry: ["AF1Qip<id>",["https://lh3.../pw/<blob>",W,H,...nulls and
+# nested arrays like [null,null,1],[9073751]...],<epoch_ms>,...
+# The filler must tolerate one level of nested [...] before the closing ].
 PHOTO_RE = re.compile(
     r'\["(AF1Qip[\w-]+)",\["(https://lh3\.googleusercontent\.com/[^"]+)"'
-    r",(\d+),(\d+)[^\]]*\],(\d+)"
+    r",(\d+),(\d+)(?:[^\[\]]|\[[^\]]*\])*\],(\d+)"
 )
 # Fallback: any ["<lh3 url>",W,H triple in the page.
 URL_RE = re.compile(r'\["(https://lh3\.googleusercontent\.com/[^"]+)",(\d+),(\d+)')
