@@ -11,6 +11,10 @@ Accepted inputs for the "album" option:
   https://photos.google.com/share/AF1Qip...?key=...
   XXXX                                    (bare short-link code)
 
+Videos in the album are listed on the same page with an lh3 poster-frame
+URL; they are detected by the video-info key in each entry's trailing
+metadata and skipped unless the include_videos option is on.
+
 One cache in data_dir: manifest_<hash>.json (TTL 6h; album contents rarely
 change and the share page can be several MB). Unlike Apple's signed URLs,
 lh3 base URLs are long-lived, so no per-photo asset cache is needed.
@@ -32,6 +36,10 @@ from typing import Any
 
 HTTP_TIMEOUT_S = 20
 MANIFEST_TTL_S = 6 * 3600
+# Bump when the parsed-photo shape changes; cached manifests from an
+# older schema are refetched rather than trusted (e.g. pre-``is_video``
+# caches would let video stills through the filter for up to the TTL).
+MANIFEST_SCHEMA = 2
 DISPLAY_BOX = 2048  # longest edge requested from lh3 for rendering
 MIN_DIM = 128  # skip avatars / tiny thumbs that share the blob
 # NOTE: must NOT claim Macintosh — photos.app.goo.gl serves a JS-only
@@ -53,6 +61,15 @@ PHOTO_RE = re.compile(
 # Fallback: any ["<lh3 url>",W,H triple in the page.
 URL_RE = re.compile(r'\["(https://lh3\.googleusercontent\.com/[^"]+)",(\d+),(\d+)')
 TITLE_RE = re.compile(r'<meta property="og:title" content="([^"]*)"')
+# Video entries carry a trailing metadata object keyed by this protobuf
+# field number (duration-ms + stream info). Photo entries never have it:
+# 0 hits across 448 photo entries in four sampled albums, present on
+# every sampled video entry. The lh3 URL itself is just the poster
+# frame, so this key is the only way to tell a video from a photo.
+VIDEO_KEY = '"76647426"'
+# An entry is ~0.5-1.5 KB; cap the balanced-bracket walk well above that
+# so a malformed page can't make us scan to EOF per entry.
+ENTRY_SCAN_CAP = 100_000
 
 
 # ----- share-link normalisation --------------------------------------
@@ -86,10 +103,41 @@ def _get_page(url: str) -> tuple[str, str | None]:
         return "", f"Could not reach Google Photos: {err}"[:200]
 
 
+def _entry_extent(page: str, start: int) -> str:
+    """Return the full ``["AF1Qip…", …]`` entry starting at ``start``
+    by walking brackets (string-aware). PHOTO_RE only reaches the
+    capture timestamp; the video marker lives further along, in the
+    entry's trailing metadata object."""
+    depth = 0
+    in_str = False
+    esc = False
+    end = min(len(page), start + ENTRY_SCAN_CAP)
+    for i in range(start, end):
+        c = page[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "[":
+            depth += 1
+        elif c == "]":
+            depth -= 1
+            if depth == 0:
+                return page[start : i + 1]
+    return page[start:end]
+
+
 def _parse_photos(page: str) -> list[dict[str, Any]]:
     photos: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for pid, url, w, h, ts in PHOTO_RE.findall(page):
+    for m in PHOTO_RE.finditer(page):
+        pid, url, w, h, ts = m.groups()
         if url in seen:
             continue
         seen.add(url)
@@ -100,6 +148,7 @@ def _parse_photos(page: str) -> list[dict[str, Any]]:
                 "width": int(w),
                 "height": int(h),
                 "taken_ms": int(ts),
+                "is_video": VIDEO_KEY in _entry_extent(page, m.start()),
             }
         )
     if photos:
@@ -116,6 +165,9 @@ def _parse_photos(page: str) -> list[dict[str, Any]]:
                 "width": int(w),
                 "height": int(h),
                 "taken_ms": None,
+                # Bare url triples carry no entry context, so videos
+                # can't be told apart on this legacy page shape.
+                "is_video": False,
             }
         )
     return photos
@@ -150,10 +202,12 @@ def _write_cache(path: Path, payload: dict[str, Any]) -> None:
         path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _load_manifest(link: str, data_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
+def _load_manifest(
+    link: str, data_dir: Path
+) -> tuple[dict[str, Any] | None, str | None]:
     cache_path = data_dir / f"manifest_{_cache_key(link)}.json"
     cached = _read_cache(cache_path, MANIFEST_TTL_S)
-    if cached is not None:
+    if cached is not None and cached.get("schema") == MANIFEST_SCHEMA:
         return cached, None
     page, err = _get_page(link)
     if err:
@@ -165,6 +219,7 @@ def _load_manifest(link: str, data_dir: Path) -> tuple[dict[str, Any] | None, st
             "with 'Create link' in Google Photos and the link is public."
         )
     manifest = {
+        "schema": MANIFEST_SCHEMA,
         "album": _parse_title(page),
         "photos": photos,
         "fetched_at": int(time.time()),
@@ -187,7 +242,9 @@ def _orientation_of(p: dict[str, Any]) -> str:
     return "landscape" if ratio > 1 else "portrait"
 
 
-def _filter_orientation(photos: list[dict[str, Any]], wanted: str) -> list[dict[str, Any]]:
+def _filter_orientation(
+    photos: list[dict[str, Any]], wanted: str
+) -> list[dict[str, Any]]:
     if wanted == "any":
         return photos
     return [p for p in photos if _orientation_of(p) == wanted]
@@ -235,6 +292,15 @@ def fetch(
         return {"error": err or "Could not load the album.", "url": None}
 
     photos = manifest.get("photos") or []
+    if not options.get("include_videos"):
+        stills = [p for p in photos if not p.get("is_video")]
+        if not stills and photos:
+            return {
+                "error": "This album only contains videos. Enable "
+                "'Include videos' to show their still frames.",
+                "url": None,
+            }
+        photos = stills
     orientation = (options.get("orientation") or "any").lower()
     filtered = _filter_orientation(photos, orientation)
     if not filtered:
