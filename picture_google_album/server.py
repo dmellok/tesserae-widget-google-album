@@ -1,10 +1,17 @@
 """picture_google_album, public Google Photos shared-album rotation.
 
 No OAuth and no API key: a Google Photos album shared "with link" serves a
-public web page whose embedded AF_initDataCallback JSON lists every photo's
+public web page whose embedded AF_initDataCallback JSON lists each photo's
 lh3.googleusercontent.com base URL, pixel dimensions and capture timestamp.
-We fetch that page, regex the entries out, and build a sized display URL by
-appending Google's =w{W}-h{H} suffix (scales to fit within, keeps aspect).
+We parse that payload as JSON and build a sized display URL by appending
+Google's =w{W}-h{H} suffix (scales to fit within, keeps aspect).
+
+The page embeds only the first ~300 items; longer albums carry a
+continuation token. We follow it with the same unauthenticated
+batchexecute RPC (rpcid snAcKc) the Google Photos web app issues while
+scrolling, so albums beyond one page rotate through everything (capped
+at MAX_ALBUM_PAGES pages as a runaway guard). A regex scrape of the page
+remains as a fallback for page shapes the JSON walk doesn't recognise.
 
 Accepted inputs for the "album" option:
   https://photos.app.goo.gl/XXXX          (short link; we follow the redirect)
@@ -30,6 +37,7 @@ import random
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -38,8 +46,12 @@ HTTP_TIMEOUT_S = 20
 MANIFEST_TTL_S = 6 * 3600
 # Bump when the parsed-photo shape changes; cached manifests from an
 # older schema are refetched rather than trusted (e.g. pre-``is_video``
-# caches would let video stills through the filter for up to the TTL).
-MANIFEST_SCHEMA = 2
+# caches would let video stills through the filter for up to the TTL,
+# and pre-pagination caches would pin big albums at the first 300).
+MANIFEST_SCHEMA = 3
+# Google embeds ~300 items per page; 20 pages ≈ 6,000 photos.
+MAX_ALBUM_PAGES = 20
+BATCHEXECUTE_URL = "https://photos.google.com/_/PhotosUi/data/batchexecute"
 DISPLAY_BOX = 2048  # longest edge requested from lh3 for rendering
 MIN_DIM = 128  # skip avatars / tiny thumbs that share the blob
 # NOTE: must NOT claim Macintosh — photos.app.goo.gl serves a JS-only
@@ -67,6 +79,12 @@ TITLE_RE = re.compile(r'<meta property="og:title" content="([^"]*)"')
 # every sampled video entry. The lh3 URL itself is just the poster
 # frame, so this key is the only way to tell a video from a photo.
 VIDEO_KEY = '"76647426"'
+VIDEO_KEY_JSON = "76647426"
+# The album payload lives in one of the page's AF_initDataCallback
+# blocks: [_, entries, next_page_token, album_meta, ...].
+DATA_CALLBACK_RE = re.compile(
+    r"AF_initDataCallback\(\{key: '[^']*', hash: '[^']*', data:"
+)
 # An entry is ~0.5-1.5 KB; cap the balanced-bracket walk well above that
 # so a malformed page can't make us scan to EOF per entry.
 ENTRY_SCAN_CAP = 100_000
@@ -90,17 +108,19 @@ def _share_url(raw: str) -> str:
 # ----- HTTP + parse ---------------------------------------------------
 
 
-def _get_page(url: str) -> tuple[str, str | None]:
+def _get_page(url: str) -> tuple[str, str, str | None]:
     """GET the share page (follows the goo.gl redirect). Returns
-    (html_text, error)."""
+    (html_text, final_url, error); final_url is the resolved
+    photos.google.com/share/… URL, needed for pagination."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
-            return resp.read().decode("utf-8", errors="replace"), None
+            text = resp.read().decode("utf-8", errors="replace")
+            return text, resp.geturl(), None
     except urllib.error.HTTPError as err:
-        return "", f"Google returned HTTP {err.code} for the share link."
+        return "", "", f"Google returned HTTP {err.code} for the share link."
     except (urllib.error.URLError, TimeoutError, OSError) as err:
-        return "", f"Could not reach Google Photos: {err}"[:200]
+        return "", "", f"Could not reach Google Photos: {err}"[:200]
 
 
 def _entry_extent(page: str, start: int) -> str:
@@ -178,6 +198,139 @@ def _parse_title(page: str) -> str:
     return html.unescape(m.group(1)).strip() if m else ""
 
 
+# ----- JSON payload + pagination --------------------------------------
+
+
+def _entry_is_video(entry: list[Any]) -> bool:
+    return any(isinstance(el, dict) and VIDEO_KEY_JSON in el for el in entry)
+
+
+def _photo_from_entry(entry: Any) -> dict[str, Any] | None:
+    try:
+        pid, desc, ts = entry[0], entry[1], entry[2]
+        url, w, h = desc[0], int(desc[1]), int(desc[2])
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    if not isinstance(pid, str) or not isinstance(url, str):
+        return None
+    if not url.startswith("https://lh3.googleusercontent.com/"):
+        return None
+    return {
+        "id": pid,
+        "base": url,
+        "width": w,
+        "height": h,
+        "taken_ms": int(ts) if isinstance(ts, (int, float)) else None,
+        "is_video": _entry_is_video(entry),
+    }
+
+
+def _album_payload(page: str) -> list[Any] | None:
+    """Pick the AF_initDataCallback block that holds the album payload:
+    the candidate whose entry list yields the most parseable photos."""
+    decoder = json.JSONDecoder()
+    best: list[Any] | None = None
+    best_photos = -1
+    for m in DATA_CALLBACK_RE.finditer(page):
+        try:
+            data, _ = decoder.raw_decode(page, m.end())
+        except ValueError:
+            continue
+        if not (
+            isinstance(data, list) and len(data) >= 4 and isinstance(data[1], list)
+        ):
+            continue
+        n = sum(1 for e in data[1] if _photo_from_entry(e) is not None)
+        if n > best_photos:
+            best, best_photos = data, n
+    return best
+
+
+def _share_context(final_url: str) -> tuple[str | None, str | None]:
+    """(share_token, auth_key) from the resolved share URL."""
+    m = re.search(r"/share/([^/?#]+)", final_url or "")
+    if not m:
+        return None, None
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(final_url).query)
+    return m.group(1), (query.get("key") or [None])[0]
+
+
+def _fetch_album_page(
+    share_token: str, auth_key: str | None, page_token: str
+) -> tuple[list[Any], str | None, str | None]:
+    """One snAcKc batchexecute call, the RPC the Google Photos web app
+    issues while scrolling a shared album. Anonymous: the share token
+    and the link's key parameter are the only credentials. Returns
+    (entries, next_token, error)."""
+    inner = json.dumps([share_token, page_token, None, auth_key])
+    freq = json.dumps([[["snAcKc", inner, None, "generic"]]])
+    body = urllib.parse.urlencode({"f.req": freq}).encode()
+    req = urllib.request.Request(
+        BATCHEXECUTE_URL,
+        data=body,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as err:
+        return [], None, str(err)[:200]
+    idx = text.find('[["wrb.fr","snAcKc"')
+    if idx < 0:
+        return [], None, "unexpected batchexecute response"
+    try:
+        envelope, _ = json.JSONDecoder().raw_decode(text, idx)
+        payload = json.loads(envelope[0][2])
+    except (ValueError, TypeError, IndexError):
+        # An error envelope carries null where the payload string goes.
+        return [], None, "could not parse batchexecute payload"
+    entries = payload[1] if len(payload) > 1 and isinstance(payload[1], list) else []
+    token = payload[2] if len(payload) > 2 else None
+    token = token if isinstance(token, str) and token else None
+    return entries, token, None
+
+
+def _photos_from_page(page: str, final_url: str) -> tuple[list[dict[str, Any]], str]:
+    """All album photos: the entries embedded in the share page plus,
+    for albums longer than one embedded page, the rest via pagination.
+    Returns (photos, album_title); title may be empty."""
+    data = _album_payload(page)
+    if data is None:
+        return _parse_photos(page), ""
+    photos: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(entries: list[Any]) -> None:
+        for e in entries:
+            p = _photo_from_entry(e)
+            if p is not None and p["base"] not in seen:
+                seen.add(p["base"])
+                photos.append(p)
+
+    add(data[1])
+    meta = data[3]
+    title = (
+        meta[1]
+        if isinstance(meta, list) and len(meta) > 1 and isinstance(meta[1], str)
+        else ""
+    )
+    token = data[2] if len(data) > 2 and isinstance(data[2], str) and data[2] else None
+    share_token, auth_key = _share_context(final_url)
+    pages = 0
+    while token and share_token and pages < MAX_ALBUM_PAGES:
+        entries, token, err = _fetch_album_page(share_token, auth_key, token)
+        if err:
+            break  # partial album beats an error; TTL retries later
+        add(entries)
+        pages += 1
+    if not photos:
+        return _parse_photos(page), title
+    return photos, title
+
+
 # ----- manifest cache -------------------------------------------------
 
 
@@ -209,10 +362,10 @@ def _load_manifest(
     cached = _read_cache(cache_path, MANIFEST_TTL_S)
     if cached is not None and cached.get("schema") == MANIFEST_SCHEMA:
         return cached, None
-    page, err = _get_page(link)
+    page, final_url, err = _get_page(link)
     if err:
         return None, err
-    photos = _parse_photos(page)
+    photos, title = _photos_from_page(page, final_url)
     if not photos:
         return None, (
             "No photos found at that link. Make sure the album is shared "
@@ -220,7 +373,7 @@ def _load_manifest(
         )
     manifest = {
         "schema": MANIFEST_SCHEMA,
-        "album": _parse_title(page),
+        "album": title or _parse_title(page),
         "photos": photos,
         "fetched_at": int(time.time()),
     }

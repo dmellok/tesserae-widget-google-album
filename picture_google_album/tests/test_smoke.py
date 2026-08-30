@@ -84,7 +84,7 @@ def test_orientation_and_display_url():
 
 def test_fetch_uses_cached_manifest(tmp_path, monkeypatch):
     def boom(url):
-        return "", "should not fetch, manifest is cached"
+        return "", "", "should not fetch, manifest is cached"
 
     monkeypatch.setattr(server, "_get_page", boom)
     link = "https://photos.app.goo.gl/Xy9"
@@ -144,7 +144,9 @@ def test_parse_photos_flags_videos():
 
 
 def test_fetch_skips_videos_by_default(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "_get_page", lambda url: ("", "no network in tests"))
+    monkeypatch.setattr(
+        server, "_get_page", lambda url: ("", "", "no network in tests")
+    )
     link = "https://photos.app.goo.gl/Vid1"
     manifest = {
         "schema": server.MANIFEST_SCHEMA,
@@ -166,7 +168,9 @@ def test_fetch_skips_videos_by_default(tmp_path, monkeypatch):
 
 
 def test_fetch_errors_when_album_is_all_videos(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "_get_page", lambda url: ("", "no network in tests"))
+    monkeypatch.setattr(
+        server, "_get_page", lambda url: ("", "", "no network in tests")
+    )
     link = "https://photos.app.goo.gl/Vid2"
     photos = [p for p in server._parse_photos(VIDEO_PAGE) if p["is_video"]]
     manifest = {
@@ -183,6 +187,93 @@ def test_fetch_errors_when_album_is_all_videos(tmp_path, monkeypatch):
     assert "videos" in out["error"]
 
 
+# Trimmed real page shape: the album payload is one of several
+# AF_initDataCallback blocks; [_, entries, next_page_token, album_meta].
+JSON_PAGE = (
+    "<html>AF_initDataCallback({key: 'ds:0', hash: '1', data:[1,2,3,4]"
+    ", sideChannel: {}});"
+    "AF_initDataCallback({key: 'ds:1', hash: '2', data:[null,"
+    '[["AF1QipJson1",'
+    '["https://lh3.googleusercontent.com/pw/J1",4032,2268,null,'
+    '[null,null,1],[9073751]],1735427730483,"tok1",39600000,'
+    '{"15":15110}],'
+    '["AF1QipJson2",'
+    '["https://lh3.googleusercontent.com/pw/J2",1080,1920],'
+    '1735427730000,"tok2",39600000,'
+    '{"15":419943,"76647426":[null,null,null,null,null,4]}]],'
+    '"",["AF1QipAlbumMeta","JSON Album"]], sideChannel: {}});'
+)
+
+
+def test_photos_from_page_json_payload():
+    photos, title = server._photos_from_page(JSON_PAGE, "")
+    assert title == "JSON Album"
+    assert len(photos) == 2
+    by_id = {p["id"]: p for p in photos}
+    assert by_id["AF1QipJson1"]["width"] == 4032
+    assert by_id["AF1QipJson1"]["taken_ms"] == 1735427730483
+    assert by_id["AF1QipJson1"]["is_video"] is False
+    assert by_id["AF1QipJson2"]["is_video"] is True
+
+
+def test_share_context():
+    tok, key = server._share_context(
+        "https://photos.google.com/share/AF1QipShare?key=SECRET"
+    )
+    assert tok == "AF1QipShare"
+    assert key == "SECRET"
+    assert server._share_context("") == (None, None)
+    assert server._share_context("https://photos.google.com/") == (None, None)
+
+
+def test_photos_from_page_follows_continuation_token(monkeypatch):
+    page = JSON_PAGE.replace('"",["AF1QipAlbumMeta"', '"TOKEN1",["AF1QipAlbumMeta"')
+    calls = []
+
+    def fake_fetch(share_token, auth_key, page_token):
+        calls.append((share_token, auth_key, page_token))
+        entry = [
+            "AF1QipJson3",
+            ["https://lh3.googleusercontent.com/pw/J3", 800, 600],
+            1735427731000,
+        ]
+        return [entry], None, None
+
+    monkeypatch.setattr(server, "_fetch_album_page", fake_fetch)
+    photos, _ = server._photos_from_page(
+        page, "https://photos.google.com/share/AF1QipShare?key=SECRET"
+    )
+    assert calls == [("AF1QipShare", "SECRET", "TOKEN1")]
+    assert [p["id"] for p in photos] == ["AF1QipJson1", "AF1QipJson2", "AF1QipJson3"]
+
+
+def test_photos_from_page_pagination_error_keeps_partial(monkeypatch):
+    page = JSON_PAGE.replace('"",["AF1QipAlbumMeta"', '"TOKEN1",["AF1QipAlbumMeta"')
+    monkeypatch.setattr(
+        server, "_fetch_album_page", lambda *a: ([], None, "network down")
+    )
+    photos, _ = server._photos_from_page(
+        page, "https://photos.google.com/share/AF1QipShare?key=SECRET"
+    )
+    assert len(photos) == 2  # embedded photos survive the failed page fetch
+
+
+def test_fetch_end_to_end_json_page(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        server,
+        "_get_page",
+        lambda url: (JSON_PAGE, "https://photos.google.com/share/AF1QipShare", None),
+    )
+    out = server.fetch(
+        {"album": "https://photos.app.goo.gl/Json1"},
+        {},
+        ctx={"data_dir": str(tmp_path)},
+    )
+    assert out["stream"] == "JSON Album"
+    assert out["count"] == 1  # the video is excluded by default
+    assert "J1" in out["url"]
+
+
 def test_stale_schema_manifest_is_refetched(tmp_path, monkeypatch):
     # Pre-``is_video`` caches must not satisfy the load; the widget
     # refetches so videos can't slip through for the rest of the TTL.
@@ -190,7 +281,7 @@ def test_stale_schema_manifest_is_refetched(tmp_path, monkeypatch):
 
     def fake_get(url):
         fetched["n"] += 1
-        return SAMPLE_PAGE, None
+        return SAMPLE_PAGE, "https://photos.google.com/share/AF1Old?key=k", None
 
     monkeypatch.setattr(server, "_get_page", fake_get)
     link = "https://photos.app.goo.gl/Old1"

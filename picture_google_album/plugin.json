@@ -1,7 +1,7 @@
 {
   "tesserae_compat": "1.x",
   "name": "Picture, Google Shared Album",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "kind": "widget",
   "requires": [
     "network:photos.app.goo.gl",
