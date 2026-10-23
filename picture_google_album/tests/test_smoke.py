@@ -296,3 +296,30 @@ def test_stale_schema_manifest_is_refetched(tmp_path, monkeypatch):
     out = server.fetch({"album": link}, {}, ctx={"data_dir": str(tmp_path)})
     assert fetched["n"] == 1
     assert out["count"] == 2
+
+
+def test_options_panel_is_short_and_keeps_saved_cells() -> None:
+    """The essentials up front, fine-tuning under More options and last;
+    no option, choice value or default a saved cell holds has changed."""
+    import json
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    m = json.loads((root / "plugin.json").read_text(encoding="utf-8"))
+    opts = m["cell_options"]
+    by = {o["name"]: o for o in opts}
+    always = [o["name"] for o in opts if not o.get("show_if") and not o.get("advanced")]
+    assert always == ["album", "mode", "orientation", "scale"]
+    first_adv = next(i for i, o in enumerate(opts) if o.get("advanced"))
+    assert all(o.get("advanced") for o in opts[first_adv:])
+    for o in opts:
+        assert ":" not in o["label"] and "(" not in o["label"], o["label"]
+    old = json.loads(
+        (root / "tests" / "options_v0_3_0.json").read_text(encoding="utf-8")
+    )
+    assert set(old) == set(by)
+    for name, was in old.items():
+        o = by[name]
+        assert o["type"] == was["type"] and o.get("default") == was["default"], name
+        assert [c["value"] for c in o.get("choices", [])] == was["values"], name
+    assert "—" not in json.dumps(m, ensure_ascii=False)

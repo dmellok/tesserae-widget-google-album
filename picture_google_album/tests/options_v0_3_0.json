@@ -1,0 +1,50 @@
+{
+  "album": {
+    "type": "string",
+    "default": "",
+    "values": []
+  },
+  "orientation": {
+    "type": "select",
+    "default": "any",
+    "values": [
+      "any",
+      "portrait",
+      "landscape",
+      "square"
+    ]
+  },
+  "mode": {
+    "type": "select",
+    "default": "random",
+    "values": [
+      "random",
+      "sequential"
+    ]
+  },
+  "scale": {
+    "type": "select",
+    "default": "fit",
+    "values": [
+      "fit",
+      "fill",
+      "stretch",
+      "blurred"
+    ]
+  },
+  "show_caption": {
+    "type": "boolean",
+    "default": true,
+    "values": []
+  },
+  "show_sequence": {
+    "type": "boolean",
+    "default": true,
+    "values": []
+  },
+  "include_videos": {
+    "type": "boolean",
+    "default": false,
+    "values": []
+  }
+}
