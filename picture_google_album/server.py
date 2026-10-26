@@ -403,6 +403,28 @@ def _filter_orientation(
     return [p for p in photos if _orientation_of(p) == wanted]
 
 
+def _pick_split(
+    photos: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any] | None, int]:
+    """Split-view draw: any photo, plus a second distinct photo of the
+    same shape when it is portrait or landscape (squares show alone).
+    The client decides whether the pair fits the cell. Returns
+    (photo, mate_or_None, 1-based index)."""
+    i = random.randrange(len(photos))
+    photo = photos[i]
+    shape = _orientation_of(photo)
+    mates = (
+        [
+            p
+            for p in photos
+            if p["base"] != photo["base"] and _orientation_of(p) == shape
+        ]
+        if shape in ("portrait", "landscape")
+        else []
+    )
+    return photo, (random.choice(mates) if mates else None), i + 1
+
+
 def _display_url(p: dict[str, Any]) -> str:
     w = int(p.get("width") or 0) or DISPLAY_BOX
     h = int(p.get("height") or 0) or DISPLAY_BOX
@@ -455,13 +477,17 @@ def fetch(
             }
         photos = stills
     orientation = (options.get("orientation") or "any").lower()
-    filtered = _filter_orientation(photos, orientation)
+    # Split view draws from the whole album; the client decides per cell
+    # whether the drawn photo is shown alone or with its mate.
+    split = orientation == "splitview"
+    filtered = photos if split else _filter_orientation(photos, orientation)
     if not filtered:
         return {"error": f"No {orientation} photos in this album.", "url": None}
 
     mode = options.get("mode", "random")
+    second = None
     if mode == "sequential":
-        suffix = f"_{orientation}" if orientation != "any" else ""
+        suffix = f"_{orientation}" if orientation not in ("any", "splitview") else ""
         idx_file = data_dir / f".seq_idx_{_cache_key(link)}{suffix}"
         try:
             current = int(idx_file.read_text(encoding="utf-8"))
@@ -472,6 +498,8 @@ def fetch(
             idx_file.write_text(str(next_idx), encoding="utf-8")
         photo = filtered[next_idx]
         index = next_idx + 1
+    elif split:
+        photo, second, index = _pick_split(filtered)
     else:
         photo = random.choice(filtered)
         index = filtered.index(photo) + 1
@@ -485,4 +513,6 @@ def fetch(
         "height": photo.get("height"),
         "index": index,
         "count": len(filtered),
+        # Split view only: a second photo of the same shape as ``url``.
+        "url2": _display_url(second) if second else None,
     }
