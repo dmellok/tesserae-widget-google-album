@@ -317,9 +317,51 @@ def test_options_panel_is_short_and_keeps_saved_cells() -> None:
     old = json.loads(
         (root / "tests" / "options_v0_3_0.json").read_text(encoding="utf-8")
     )
-    assert set(old) == set(by)
+    assert set(old) <= set(by)
+    assert set(by) - set(old) == {"pair_gap", "pair_divider"}
     for name, was in old.items():
         o = by[name]
         assert o["type"] == was["type"] and o.get("default") == was["default"], name
-        assert [c["value"] for c in o.get("choices", [])] == was["values"], name
+        assert [c["value"] for c in o.get("choices", [])][: len(was["values"])] == was["values"], name
     assert "—" not in json.dumps(m, ensure_ascii=False)
+
+
+def _mk(n, w, h):
+    return {"id": f"id{n}", "base": f"https://lh3.googleusercontent.com/pw/{n}",
+            "width": w, "height": h, "taken_ms": None, "is_video": False}
+
+
+def test_pick_split_mate_has_same_shape(monkeypatch):
+    photos = [_mk("L1", 1600, 900), _mk("P1", 900, 1600), _mk("P2", 900, 1600)]
+    monkeypatch.setattr(server.random, "randrange", lambda n: 1)  # P1
+    photo, mate, idx = server._pick_split(photos)
+    assert photo["id"] == "idP1" and mate["id"] == "idP2" and idx == 2
+
+
+def test_pick_split_mate_is_never_the_same_image():
+    dup = _mk("P1", 900, 1600)
+    photos = [dup, dict(dup), _mk("P2", 900, 1600)]  # same image listed twice
+    for _ in range(100):
+        photo, mate, _i = server._pick_split(photos)
+        assert mate is not None and mate["base"] != photo["base"]
+
+
+def test_pick_split_alone_without_mate_or_for_square():
+    photos = [_mk("L1", 1600, 900), _mk("P1", 900, 1600), _mk("S1", 1000, 1000), _mk("S2", 1000, 1000)]
+    for _ in range(100):
+        photo, mate, _i = server._pick_split(photos)
+        assert mate is None, photo["id"]
+
+
+def test_fetch_splitview_returns_mate(tmp_path):
+    link = "https://photos.app.goo.gl/Xy9"
+    photos = [_mk(f"P{i}", 900, 1600) for i in range(3)]
+    manifest = {"schema": server.MANIFEST_SCHEMA, "album": "A", "photos": photos, "fetched_at": 0}
+    server._write_cache(tmp_path / f"manifest_{server._cache_key(link)}.json", manifest)
+    ctx = {"data_dir": str(tmp_path)}
+    out = server.fetch({"album": link, "orientation": "splitview"}, {}, ctx=ctx)
+    assert out["url2"] and out["url"] != out["url2"] and out["count"] == 3
+    out = server.fetch({"album": link, "orientation": "portrait"}, {}, ctx=ctx)
+    assert out["url2"] is None
+    out = server.fetch({"album": link, "orientation": "splitview", "mode": "sequential"}, {}, ctx=ctx)
+    assert out["url2"] is None and out["index"] == 1

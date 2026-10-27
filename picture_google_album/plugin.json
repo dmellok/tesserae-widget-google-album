@@ -1,7 +1,7 @@
 {
   "tesserae_compat": "1.x",
   "name": "Picture, Google Shared Album",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "kind": "widget",
   "requires": [
     "network:photos.app.goo.gl",
@@ -62,9 +62,13 @@
         {
           "value": "square",
           "label": "Square"
+        },
+        {
+          "value": "splitview",
+          "label": "Split view"
         }
       ],
-      "help": "Only photos of this shape."
+      "help": "Only photos of this shape. Split view shows a portrait photo as a pair in a landscape cell, or a landscape photo as a pair in a portrait cell. Square photos and near-square cells are never paired. Split view pairs only with random selection."
     },
     {
       "name": "scale",
@@ -96,7 +100,12 @@
       "label": "Caption",
       "default": true,
       "help": "The photo's date and the album name over the bottom of the photo.",
-      "advanced": true
+      "advanced": true,
+      "show_if": {
+        "orientation": {
+          "not": "splitview"
+        }
+      }
     },
     {
       "name": "show_sequence",
@@ -104,7 +113,50 @@
       "label": "Position in the album",
       "default": true,
       "help": "Which photo this is out of how many, such as 3 / 12.",
-      "advanced": true
+      "advanced": true,
+      "show_if": {
+        "orientation": {
+          "not": "splitview"
+        }
+      }
+    },
+    {
+      "name": "pair_gap",
+      "type": "number",
+      "label": "Gap between pair",
+      "default": 2,
+      "advanced": true,
+      "help": "Space between the two photos of a pair, in pixels. 0 for none.",
+      "min": 0,
+      "max": 100,
+      "show_if": {
+        "orientation": "splitview"
+      }
+    },
+    {
+      "name": "pair_divider",
+      "type": "select",
+      "label": "Divider colour",
+      "default": "background",
+      "advanced": true,
+      "choices": [
+        {
+          "value": "background",
+          "label": "Background"
+        },
+        {
+          "value": "white",
+          "label": "White"
+        },
+        {
+          "value": "black",
+          "label": "Black"
+        }
+      ],
+      "help": "Colour of the gap between the two photos of a pair.",
+      "show_if": {
+        "orientation": "splitview"
+      }
     },
     {
       "name": "include_videos",
@@ -156,6 +208,11 @@
         "name": "count",
         "type": "num",
         "label": "Photos after filter"
+      },
+      {
+        "name": "url2",
+        "type": "str",
+        "label": "Second photo URL (pair)"
       }
     ],
     "sample": {
@@ -166,7 +223,8 @@
       "width": 2048,
       "height": 1536,
       "index": 3,
-      "count": 12
+      "count": 12,
+      "url2": null
     }
   }
 }
