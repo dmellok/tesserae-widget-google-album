@@ -33,6 +33,7 @@ import contextlib
 import hashlib
 import html
 import json
+import math
 import random
 import re
 import time
@@ -52,7 +53,10 @@ MANIFEST_SCHEMA = 3
 # Google embeds ~300 items per page; 20 pages ≈ 6,000 photos.
 MAX_ALBUM_PAGES = 20
 BATCHEXECUTE_URL = "https://photos.google.com/_/PhotosUi/data/batchexecute"
-DISPLAY_BOX = 2048  # longest edge requested from lh3 for rendering
+DISPLAY_BOX = 2048  # longest edge requested from lh3 when the cell size is unknown
+# With the cell size known, each photo is requested just big enough to cover
+# the cell: a 4K TV gets a 4K photo, an 800 x 480 tag about 800 px.
+CELL_MAX_EDGE = 8192
 MIN_DIM = 128  # skip avatars / tiny thumbs that share the blob
 # NOTE: must NOT claim Macintosh — photos.app.goo.gl serves a JS-only
 # Firebase Dynamic Links interstitial (no 302, no photos) to Mac desktop
@@ -425,12 +429,36 @@ def _pick_split(
     return photo, (random.choice(mates) if mates else None), i + 1
 
 
-def _display_url(p: dict[str, Any]) -> str:
+def _display_url(p: dict[str, Any], cell: tuple[int, int] | None = None) -> str:
     w = int(p.get("width") or 0) or DISPLAY_BOX
     h = int(p.get("height") or 0) or DISPLAY_BOX
-    box_w = min(w, DISPLAY_BOX)
-    box_h = min(h, DISPLAY_BOX)
+    if cell is None:
+        box_w = min(w, DISPLAY_BOX)
+        box_h = min(h, DISPLAY_BOX)
+    else:
+        box_w, box_h = _cover_box(w, h, cell)
     return f"{p['base']}=w{box_w}-h{box_h}"
+
+
+def _cover_box(w: int, h: int, cell: tuple[int, int]) -> tuple[int, int]:
+    """The =w-h box that makes lh3 return the photo just covering ``cell``:
+    lh3 fits inside the box, so the box is the cover size itself. Never
+    bigger than the photo, so a small photo isn't enlarged."""
+    scale = min(1.0, max(cell[0] / w, cell[1] / h))
+    return max(1, math.ceil(w * scale)), max(1, math.ceil(h * scale))
+
+
+def _cell_size(ctx: dict[str, Any]) -> tuple[int, int] | None:
+    """The size of the cell being drawn, when the host says (Tesserae passes
+    ``cell_w`` / ``cell_h``); None keeps the old fixed DISPLAY_BOX request."""
+    try:
+        w = int(ctx.get("cell_w") or 0)
+        h = int(ctx.get("cell_h") or 0)
+    except (TypeError, ValueError):
+        return None
+    if w <= 0 or h <= 0:
+        return None
+    return min(w, CELL_MAX_EDGE), min(h, CELL_MAX_EDGE)
 
 
 def _iso_date(ms: Any) -> str | None:
@@ -504,8 +532,9 @@ def fetch(
         photo = random.choice(filtered)
         index = filtered.index(photo) + 1
 
+    cell = _cell_size(ctx)
     return {
-        "url": _display_url(photo),
+        "url": _display_url(photo, cell),
         "id": photo.get("id"),
         "date": _iso_date(photo.get("taken_ms")),
         "stream": manifest.get("album") or "",
@@ -514,5 +543,5 @@ def fetch(
         "index": index,
         "count": len(filtered),
         # Split view only: a second photo of the same shape as ``url``.
-        "url2": _display_url(second) if second else None,
+        "url2": _display_url(second, cell) if second else None,
     }
