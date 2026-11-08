@@ -365,3 +365,31 @@ def test_fetch_splitview_returns_mate(tmp_path):
     assert out["url2"] is None
     out = server.fetch({"album": link, "orientation": "splitview", "mode": "sequential"}, {}, ctx=ctx)
     assert out["url2"] is None and out["index"] == 1
+
+
+def test_display_url_covers_the_cell_without_enlarging():
+    photo = {"base": "https://lh3.googleusercontent.com/pw/AAAA", "width": 6000, "height": 4000}
+    # A 4K cell gets a photo just covering it (fit inside the box = cover).
+    assert server._display_url(photo, (3840, 2160)).endswith("=w3840-h2560")
+    # A small e-paper cell gets a small photo.
+    assert server._display_url(photo, (800, 480)).endswith("=w800-h534")
+    # A photo smaller than the cell is never enlarged.
+    small = {"base": "https://lh3.googleusercontent.com/pw/CCCC", "width": 1600, "height": 1200}
+    assert server._display_url(small, (3840, 2160)).endswith("=w1600-h1200")
+
+
+def test_fetch_sizes_photos_to_the_cell(tmp_path, monkeypatch):
+    link = "https://photos.app.goo.gl/Xy9"
+    manifest = {
+        "schema": server.MANIFEST_SCHEMA,
+        "album": "Cached",
+        "photos": server._parse_photos(SAMPLE_PAGE),
+        "fetched_at": 0,
+    }
+    server._write_cache(tmp_path / f"manifest_{server._cache_key(link)}.json", manifest)
+    ctx = {"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480}
+    out = server.fetch({"album": link, "mode": "sequential"}, {}, ctx=ctx)
+    assert out["url"].endswith("=w800-h600")
+    # Without a cell size the old fixed request stays.
+    out = server.fetch({"album": link, "mode": "sequential"}, {}, ctx={"data_dir": str(tmp_path)})
+    assert out["url"].endswith("=w900-h1600")
