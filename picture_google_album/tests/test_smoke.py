@@ -365,3 +365,11 @@ def test_fetch_splitview_returns_mate(tmp_path):
     assert out["url2"] is None
     out = server.fetch({"album": link, "orientation": "splitview", "mode": "sequential"}, {}, ctx=ctx)
     assert out["url2"] is None and out["index"] == 1
+
+
+def test_manifest_lets_lineups_draw_another_photo():
+    import json
+    from pathlib import Path
+
+    manifest = json.loads((Path(server.__file__).parent / "plugin.json").read_text())
+    assert manifest["lineups"] == {"draw": True}

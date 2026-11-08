@@ -167,6 +167,9 @@
       "advanced": true
     }
   ],
+  "lineups": {
+    "draw": true
+  },
   "render": {
     "dither": "floyd-steinberg",
     "needs_network": true,
