@@ -14,6 +14,8 @@ The "Split view" orientation draws from the whole album: a portrait photo in a l
 
 Each photo is requested from Google just big enough to cover the cell it is drawn in, so a 4K screen gets a 4K photo and an 800 x 480 e-paper tag about 800 px; a photo smaller than the cell is not enlarged.
 
+On the Lineups page, the arrows on a step showing this widget draw another photo (the widget declares `"lineups": {"draw": true}`).
+
 Note: this relies on the share page's markup, which Google could change; the parser has a fallback pattern but may need updating if that happens.
 
 ## Install

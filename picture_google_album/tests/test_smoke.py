@@ -393,3 +393,11 @@ def test_fetch_sizes_photos_to_the_cell(tmp_path, monkeypatch):
     # Without a cell size the old fixed request stays.
     out = server.fetch({"album": link, "mode": "sequential"}, {}, ctx={"data_dir": str(tmp_path)})
     assert out["url"].endswith("=w900-h1600")
+
+
+def test_manifest_lets_lineups_draw_another_photo():
+    import json
+    from pathlib import Path
+
+    manifest = json.loads((Path(server.__file__).parent / "plugin.json").read_text())
+    assert manifest["lineups"] == {"draw": True}
