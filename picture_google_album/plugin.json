@@ -165,9 +165,19 @@
       "default": false,
       "help": "Includes the album's videos, shown as a still frame.",
       "advanced": true
+    },
+    {
+      "name": "pinned_asset",
+      "type": "string",
+      "label": "Pinned photo",
+      "default": "",
+      "advanced": true,
+      "help": "Set by Show chosen on the Lineups page. Shows this one photo instead of rotating; clear it to rotate again."
     }
   ],
   "lineups": {
+    "pin_option": "pinned_asset",
+    "noun": "photos",
     "draw": true
   },
   "render": {

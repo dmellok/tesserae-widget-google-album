@@ -25,6 +25,11 @@ metadata and skipped unless the include_videos option is on.
 One cache in data_dir: manifest_<hash>.json (TTL 6h; album contents rarely
 change and the share page can be several MB). Unlike Apple's signed URLs,
 lh3 base URLs are long-lived, so no per-photo asset cache is needed.
+
+Lineups: ``lineup_items`` lists the album's photos from that same manifest
+cache (a small ``=w320-h320`` thumbnail each), ``lineup_item_count`` counts
+them, and the ``pinned_asset`` option makes ``fetch`` show one chosen photo
+without moving the sequential cursor.
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ import json
 import math
 import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -53,6 +59,8 @@ MANIFEST_SCHEMA = 3
 # Google embeds ~300 items per page; 20 pages ≈ 6,000 photos.
 MAX_ALBUM_PAGES = 20
 BATCHEXECUTE_URL = "https://photos.google.com/_/PhotosUi/data/batchexecute"
+LINEUP_THUMB_BOX = 320  # =w-h box of the small preview in the Lineups editor
+LINEUP_LOAD_BUDGET_S = 4.0  # longest a Lineups listing waits for an uncached album
 DISPLAY_BOX = 2048  # longest edge requested from lh3 when the cell size is unknown
 # With the cell size known, each photo is requested just big enough to cover
 # the cell: a 4K TV gets a 4K photo, an 800 x 480 tag about 800 px.
@@ -470,6 +478,115 @@ def _iso_date(ms: Any) -> str | None:
         return None
 
 
+# ----- Lineups: list, count and pin photos ------------------------------
+
+
+def _photo_key(p: dict[str, Any]) -> str:
+    """A photo's stable key: Google's own id, or a hash of its URL for the
+    legacy page shape that carries none."""
+    pid = p.get("id")
+    if isinstance(pid, str) and pid:
+        return pid
+    return "u" + hashlib.sha1(str(p.get("base")).encode("utf-8")).hexdigest()[:12]
+
+
+def _pinned_photo(options: dict[str, Any], photos: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The photo ``pinned_asset`` names, or None (unset or no longer in the
+    album, in which case the widget behaves as if nothing were pinned)."""
+    key = str(options.get("pinned_asset") or "").strip()
+    if not key:
+        return None
+    return next((p for p in photos if _photo_key(p) == key), None)
+
+
+def _candidates(options: dict[str, Any], photos: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The photos the widget draws from under these options: videos only when
+    asked for, then the orientation filter (split view takes them all)."""
+    if not options.get("include_videos"):
+        photos = [p for p in photos if not p.get("is_video")]
+    orientation = (options.get("orientation") or "any").lower()
+    return photos if orientation == "splitview" else _filter_orientation(photos, orientation)
+
+
+_LOADING: set[str] = set()
+_LOADING_LOCK = threading.Lock()
+
+
+def _lineup_manifest(link: str, data_dir: Path) -> dict[str, Any] | None:
+    """The album's manifest for a Lineups listing: the cached one however old
+    (a render refreshes it), else one load held to LINEUP_LOAD_BUDGET_S. A
+    load that outlasts the budget keeps running and fills the cache."""
+    path = data_dir / f"manifest_{_cache_key(link)}.json"
+    with contextlib.suppress(OSError, json.JSONDecodeError):
+        cached = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(cached, dict) and cached.get("schema") == MANIFEST_SCHEMA:
+            return cached
+    result: list[dict[str, Any] | None] = []
+
+    def load() -> None:
+        try:
+            result.append(_load_manifest(link, data_dir)[0])
+        except Exception:
+            result.append(None)
+        finally:
+            with _LOADING_LOCK:
+                _LOADING.discard(link)
+
+    with _LOADING_LOCK:
+        if link in _LOADING:
+            return None
+        _LOADING.add(link)
+    worker = threading.Thread(target=load, daemon=True)
+    worker.start()
+    worker.join(LINEUP_LOAD_BUDGET_S)
+    return result[0] if result else None
+
+
+def _lineup_photos(options: dict[str, Any], ctx: dict[str, Any] | None) -> list[dict[str, Any]]:
+    link = _share_url(str(options.get("album") or ""))
+    data_dir = (ctx or {}).get("data_dir")
+    if not link or not data_dir:
+        return []
+    manifest = _lineup_manifest(link, Path(str(data_dir)))
+    if not manifest:
+        return []
+    seen: set[str] = set()
+    out = []
+    for p in _candidates(options, manifest.get("photos") or []):
+        key = _photo_key(p)
+        if key not in seen:
+            seen.add(key)
+            out.append(p)
+    return out
+
+
+def lineup_items(
+    options: dict[str, Any], *, ctx: dict[str, Any] | None = None
+) -> list[dict[str, str]]:
+    """The album's photos for the Lineups page, with a small preview each.
+    Read from the cached manifest (see ``_lineup_manifest``); empty when the
+    album is unknown or can't be loaded in time."""
+    items = []
+    for n, p in enumerate(_lineup_photos(options, ctx), 1):
+        taken = _iso_date(p.get("taken_ms"))
+        items.append(
+            {
+                "key": _photo_key(p),
+                "label": taken[:10] if taken else f"Photo {n}",
+                "thumb": f"{p['base']}=w{LINEUP_THUMB_BOX}-h{LINEUP_THUMB_BOX}",
+            }
+        )
+    return items
+
+
+def lineup_item_count(
+    options: dict[str, Any], *, ctx: dict[str, Any] | None = None
+) -> int | None:
+    """How many photos the widget draws from, or None when unknown."""
+    n = len(_lineup_photos(options, ctx))
+    return n or None
+
+
 # ----- plugin contract ------------------------------------------------
 
 
@@ -495,6 +612,25 @@ def fetch(
         return {"error": err or "Could not load the album.", "url": None}
 
     photos = manifest.get("photos") or []
+    pinned = _pinned_photo(options, photos)
+    if pinned is not None:
+        # A photo chosen from Lineups: show exactly it. Nothing below runs, so
+        # the sequential cursor and the draw are left where they were.
+        pool = _candidates(options, photos) or photos
+        shown = next((i for i, p in enumerate(pool) if p is pinned), None)
+        if shown is None:
+            pool, shown = photos, photos.index(pinned)
+        return {
+            "url": _display_url(pinned, _cell_size(ctx)),
+            "id": pinned.get("id"),
+            "date": _iso_date(pinned.get("taken_ms")),
+            "stream": manifest.get("album") or "",
+            "width": pinned.get("width"),
+            "height": pinned.get("height"),
+            "index": shown + 1,
+            "count": len(pool),
+            "url2": None,
+        }
     if not options.get("include_videos"):
         stills = [p for p in photos if not p.get("is_video")]
         if not stills and photos:
