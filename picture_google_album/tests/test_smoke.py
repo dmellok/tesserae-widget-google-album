@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import server
 
 SAMPLE_PAGE = (
@@ -103,7 +105,7 @@ def test_fetch_uses_cached_manifest(tmp_path, monkeypatch):
     assert out["stream"] == "Cached"
     assert out["count"] == 2
     assert out["index"] == 1
-    assert out["url"].startswith("https://lh3.googleusercontent.com/pw/")
+    assert out["url"].startswith(f"/plugins/picture_google_album/photo/{server._cache_key(link)}/")
     assert out["date"].startswith("2021-04-19")
 
     out2 = server.fetch(
@@ -159,7 +161,7 @@ def test_fetch_skips_videos_by_default(tmp_path, monkeypatch):
 
     out = server.fetch({"album": link}, {}, ctx={"data_dir": str(tmp_path)})
     assert out["count"] == 1
-    assert "PHOTO" in out["url"]
+    assert out["url"].endswith("/AF1QipPhoto111")
 
     out = server.fetch(
         {"album": link, "include_videos": True}, {}, ctx={"data_dir": str(tmp_path)}
@@ -271,7 +273,7 @@ def test_fetch_end_to_end_json_page(tmp_path, monkeypatch):
     )
     assert out["stream"] == "JSON Album"
     assert out["count"] == 1  # the video is excluded by default
-    assert "J1" in out["url"]
+    assert out["url"].endswith("/AF1QipJson1")
 
 
 def test_stale_schema_manifest_is_refetched(tmp_path, monkeypatch):
@@ -389,10 +391,12 @@ def test_fetch_sizes_photos_to_the_cell(tmp_path, monkeypatch):
     server._write_cache(tmp_path / f"manifest_{server._cache_key(link)}.json", manifest)
     ctx = {"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480}
     out = server.fetch({"album": link, "mode": "sequential"}, {}, ctx=ctx)
-    assert out["url"].endswith("=w800-h600")
-    # Without a cell size the old fixed request stays.
+    # The page gets the proxy route, carrying the cell; the route sizes the
+    # lh3 request (see test_photo_route_sizes_the_lh3_request_to_the_cell).
+    assert out["url"].endswith("?cw=800&ch=480")
+    # Without a cell size the request carries none.
     out = server.fetch({"album": link, "mode": "sequential"}, {}, ctx={"data_dir": str(tmp_path)})
-    assert out["url"].endswith("=w900-h1600")
+    assert "?" not in out["url"]
 
 
 def test_manifest_lets_lineups_draw_another_photo():
@@ -401,3 +405,202 @@ def test_manifest_lets_lineups_draw_another_photo():
 
     manifest = json.loads((Path(server.__file__).parent / "plugin.json").read_text())
     assert manifest["lineups"] == {"draw": True}
+
+
+# ----- photos served through the widget's own route ---------------------
+
+import pytest  # noqa: E402
+
+GOOD_JPEG = b"\xff\xd8\xff\xe0" + b"photo-bytes" * 20
+ALBUM_LINK = "https://photos.app.goo.gl/Xy9"
+
+
+def _seed_manifest(data_dir, photos=None):
+    manifest = {
+        "schema": server.MANIFEST_SCHEMA,
+        "album": "Cached",
+        "photos": photos or server._parse_photos(SAMPLE_PAGE),
+        "fetched_at": 0,
+    }
+    server._write_cache(data_dir / f"manifest_{server._cache_key(ALBUM_LINK)}.json", manifest)
+
+
+class _Registry:
+    def __init__(self, data_dir):
+        self._plugin = type("P", (), {"data_dir": data_dir})()
+
+    def get(self, plugin_id):
+        return self._plugin if plugin_id == "picture_google_album" else None
+
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    flask = pytest.importorskip("flask")
+    app = flask.Flask(__name__)
+    app.config["PLUGIN_REGISTRY"] = _Registry(tmp_path)
+    app.register_blueprint(server.blueprint(), url_prefix="/plugins/picture_google_album")
+    monkeypatch.setattr(server, "_sleep", lambda s: None)
+    _seed_manifest(tmp_path)
+    return app.test_client()
+
+
+class _Upstream:
+    """Stands in for the lh3 opener: replays one outcome per call."""
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+        self.urls = []
+
+    def open(self, req, timeout=None):
+        self.urls.append(req.full_url)
+        out = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
+        if isinstance(out, Exception):
+            raise out
+        import io
+
+        return io.BytesIO(out)
+
+
+def _http_error(code):
+    import urllib.error
+
+    return urllib.error.HTTPError("https://lh3.googleusercontent.com/x", code, "x", {}, None)
+
+
+def _photo_path(key="AF1QipAbc-123", query=""):
+    return f"/plugins/picture_google_album/photo/{server._cache_key(ALBUM_LINK)}/{key}{query}"
+
+
+def test_fetch_returns_the_proxied_url_for_both_photos(tmp_path):
+    photos = [_mk(f"P{i}", 900, 1600) for i in range(3)]
+    _seed_manifest(tmp_path, photos)
+    ctx = {"data_dir": str(tmp_path), "cell_w": 480, "cell_h": 800}
+    out = server.fetch({"album": ALBUM_LINK, "orientation": "splitview"}, {}, ctx=ctx)
+    root = f"/plugins/picture_google_album/photo/{server._cache_key(ALBUM_LINK)}/"
+    for u in (out["url"], out["url2"]):
+        assert u.startswith(root) and u.endswith("?cw=480&ch=800")
+        assert "googleusercontent" not in u
+
+
+def test_photo_route_serves_the_manifest_photo(client, monkeypatch):
+    up = _Upstream(GOOD_JPEG)
+    monkeypatch.setattr(server, "_OPENER", up)
+    r = client.get(_photo_path())
+    assert r.status_code == 200
+    assert r.data == GOOD_JPEG
+    assert r.mimetype == "image/jpeg"
+    assert "max-age" in r.headers["Cache-Control"]
+    assert up.urls == ["https://lh3.googleusercontent.com/pw/AAAA=w1600-h1200"]
+
+
+def test_photo_route_sizes_the_lh3_request_to_the_cell(client, monkeypatch):
+    up = _Upstream(GOOD_JPEG)
+    monkeypatch.setattr(server, "_OPENER", up)
+    assert client.get(_photo_path(query="?cw=800&ch=480")).status_code == 200
+    assert up.urls == ["https://lh3.googleusercontent.com/pw/AAAA=w800-h600"]
+
+
+def test_photo_route_retries_then_succeeds(client, monkeypatch):
+    import urllib.error
+
+    up = _Upstream(
+        urllib.error.URLError("reset"), _http_error(503), GOOD_JPEG
+    )
+    monkeypatch.setattr(server, "_OPENER", up)
+    r = client.get(_photo_path())
+    assert r.status_code == 200 and r.data == GOOD_JPEG
+    assert len(up.urls) == 3
+
+
+def test_photo_route_retries_429_and_timeouts(client, monkeypatch):
+    up = _Upstream(_http_error(429), TimeoutError("slow"), GOOD_JPEG)
+    monkeypatch.setattr(server, "_OPENER", up)
+    assert client.get(_photo_path()).status_code == 200
+    assert len(up.urls) == 3
+
+
+def test_photo_route_gives_up_with_an_error_status(client, monkeypatch):
+    up = _Upstream(_http_error(503))
+    monkeypatch.setattr(server, "_OPENER", up)
+    r = client.get(_photo_path())
+    assert r.status_code == 502
+    assert len(up.urls) == server.PHOTO_TRIES
+    assert r.headers["Cache-Control"] == "no-store"
+
+
+def test_photo_route_does_not_retry_a_missing_photo(client, monkeypatch):
+    up = _Upstream(_http_error(404))
+    monkeypatch.setattr(server, "_OPENER", up)
+    assert client.get(_photo_path()).status_code == 502
+    assert len(up.urls) == 1
+
+
+def test_photo_route_rejects_a_non_image_answer(client, monkeypatch):
+    up = _Upstream(b"<html>consent</html>")
+    monkeypatch.setattr(server, "_OPENER", up)
+    assert client.get(_photo_path()).status_code == 502
+
+
+def test_photo_route_caches_the_bytes(client, monkeypatch, tmp_path):
+    up = _Upstream(GOOD_JPEG)
+    monkeypatch.setattr(server, "_OPENER", up)
+    assert client.get(_photo_path()).data == GOOD_JPEG
+    assert client.get(_photo_path()).data == GOOD_JPEG
+    assert len(up.urls) == 1
+    # A different size is a different photo.
+    client.get(_photo_path(query="?cw=100&ch=100"))
+    assert len(up.urls) == 2
+    # Past the TTL it is fetched again.
+    for f in (tmp_path / "photos").iterdir():
+        os.utime(f, (0, 0))
+    client.get(_photo_path())
+    assert len(up.urls) == 3
+
+
+def test_photo_route_rejects_unknown_ids(client, monkeypatch):
+    up = _Upstream(GOOD_JPEG)
+    monkeypatch.setattr(server, "_OPENER", up)
+    album = server._cache_key(ALBUM_LINK)
+    for path in (
+        _photo_path("AF1QipNotInTheAlbum"),
+        f"/plugins/picture_google_album/photo/{'0' * 16}/AF1QipAbc-123",  # unknown album
+        "/plugins/picture_google_album/photo/../AF1QipAbc-123",
+        f"/plugins/picture_google_album/photo/{album}/https%3A%2F%2Fevil.example%2Fa.jpg",
+        f"/plugins/picture_google_album/photo/{album}/..%2Fmanifest",
+        f"/plugins/picture_google_album/photo/..%2F..%2Fetc/AF1QipAbc-123",
+    ):
+        assert client.get(path).status_code == 404, path
+    assert up.urls == []  # nothing was fetched for any of them
+
+
+def test_photo_route_only_fetches_google_hosts(client, monkeypatch, tmp_path):
+    up = _Upstream(GOOD_JPEG)
+    monkeypatch.setattr(server, "_OPENER", up)
+    evil = [
+        {"id": "AF1QipEvil", "base": "https://evil.example/pw/AAAA", "width": 10, "height": 10},
+        {"id": "AF1QipEvil2", "base": "https://lh3.googleusercontent.com.evil.example/x", "width": 10, "height": 10},
+        {"id": "AF1QipEvil3", "base": "http://lh3.googleusercontent.com/x", "width": 10, "height": 10},
+    ]
+    _seed_manifest(tmp_path, evil)
+    for p in evil:
+        assert client.get(_photo_path(p["id"])).status_code == 404
+    assert up.urls == []
+
+
+def test_redirects_leaving_google_are_refused():
+    handler = server._GoogleRedirects()
+    req = server.urllib.request.Request("https://lh3.googleusercontent.com/pw/AAAA")
+    import urllib.error
+
+    with pytest.raises(urllib.error.URLError):
+        handler.redirect_request(req, None, 302, "Found", {}, "http://169.254.169.254/latest")
+
+
+def test_photo_route_is_render_safe_and_has_no_index():
+    assert server.RENDER_SAFE_ENDPOINTS == ("picture_google_album_photos.photo",)
+    flask = pytest.importorskip("flask")
+    app = flask.Flask(__name__)
+    app.register_blueprint(server.blueprint(), url_prefix="/plugins/picture_google_album")
+    rules = {r.rule for r in app.url_map.iter_rules()}
+    assert "/plugins/picture_google_album/" not in rules
+    assert "picture_google_album_photos.photo" in {r.endpoint for r in app.url_map.iter_rules()}

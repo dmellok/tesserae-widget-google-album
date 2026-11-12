@@ -25,6 +25,14 @@ metadata and skipped unless the include_videos option is on.
 One cache in data_dir: manifest_<hash>.json (TTL 6h; album contents rarely
 change and the share page can be several MB). Unlike Apple's signed URLs,
 lh3 base URLs are long-lived, so no per-photo asset cache is needed.
+
+Photos reach the page through this widget's own route,
+``/plugins/picture_google_album/photo/<album>/<photo>``, not straight from
+Google: lh3 now and then fails a request fast, and a render that hotlinks it
+captures a blank frame. The route looks the photo up in the cached manifest
+(it takes no URL from the caller), fetches the sized lh3 URL with retries,
+and keeps the bytes for an hour in ``data_dir/photos`` so a re-render or a
+preview does not fetch again.
 """
 
 from __future__ import annotations
@@ -32,10 +40,13 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import html
+import http.client
 import json
 import math
+import os
 import random
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -44,6 +55,16 @@ from pathlib import Path
 from typing import Any
 
 HTTP_TIMEOUT_S = 20
+# Serving a photo: Google sometimes fails a request in a fraction of a second
+# and answers the same URL fine a moment later, so try a few times, briefly.
+PHOTO_TIMEOUT_S = 8
+PHOTO_TRIES = 3
+PHOTO_BACKOFF_S = (0.4, 1.0)  # waits after the 1st and 2nd failed try
+PHOTO_MAX_BYTES = 30 * 1024 * 1024
+PHOTO_CACHE_TTL_S = 3600
+PHOTO_CACHE_MAX_FILES = 60
+PHOTO_CACHE_CONTROL = "private, max-age=3600"
+PHOTO_ROUTE = "/plugins/picture_google_album/photo"
 MANIFEST_TTL_S = 6 * 3600
 # Bump when the parsed-photo shape changes; cached manifests from an
 # older schema are refetched rather than trusted (e.g. pre-``is_video``
@@ -470,6 +491,218 @@ def _iso_date(ms: Any) -> str | None:
         return None
 
 
+# ----- serving photos ---------------------------------------------------
+
+_sleep = time.sleep
+_ALBUM_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+_PHOTO_ID_RE = re.compile(r"^[\w-]{1,200}$")
+
+
+def _photo_key(p: dict[str, Any]) -> str:
+    """A photo's stable key: Google's own id, or a hash of its URL for the
+    legacy page shape that carries none."""
+    pid = p.get("id")
+    if isinstance(pid, str) and pid:
+        return pid
+    return "u" + hashlib.sha1(str(p.get("base")).encode("utf-8")).hexdigest()[:12]
+
+
+def _proxy_url(link: str, p: dict[str, Any], cell: tuple[int, int] | None) -> str:
+    """The page-facing URL of a photo: this widget's route, keyed by the
+    album's cache id and the photo's key. Plain string (fetch() runs with no
+    Flask request). The cell size rides along so the route sizes the lh3
+    request itself."""
+    url = f"{PHOTO_ROUTE}/{_cache_key(link)}/{urllib.parse.quote(_photo_key(p), safe='')}"
+    if cell is not None:
+        url += f"?cw={cell[0]}&ch={cell[1]}"
+    return url
+
+
+def _is_google_image_host(url: str) -> bool:
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    return (
+        parts.scheme == "https"
+        and "@" not in parts.netloc
+        and (host == "googleusercontent.com" or host.endswith(".googleusercontent.com"))
+    )
+
+
+def _find_photo(data_dir: Path, album: str, key: str) -> dict[str, Any] | None:
+    """The manifest photo ``key`` names in album ``album``, or None. Reads the
+    manifest fetch() cached, whatever its age (a render refreshes it); never
+    loads one, and never takes a URL from the caller."""
+    if not _ALBUM_ID_RE.match(album) or not _PHOTO_ID_RE.match(key):
+        return None
+    try:
+        manifest = json.loads(
+            (data_dir / f"manifest_{album}.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict) or manifest.get("schema") != MANIFEST_SCHEMA:
+        return None
+    for p in manifest.get("photos") or []:
+        if (
+            isinstance(p, dict)
+            and _photo_key(p) == key
+            and _is_google_image_host(str(p.get("base") or ""))
+        ):
+            return p
+    return None
+
+
+def _sniff_image(body: bytes) -> str | None:
+    if body.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if body[:4] == b"GIF8":
+        return "image/gif"
+    if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+class _GoogleRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow redirects only to Google's image hosts."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        if not _is_google_image_host(newurl):
+            raise urllib.error.URLError(f"redirect to a non-Google host: {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_GoogleRedirects)
+
+
+def _get_photo_once(url: str) -> tuple[bytes | None, bool]:
+    """One GET of a lh3 URL. Returns (body, retry): body is None on failure,
+    and retry says whether another try could help."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with _OPENER.open(req, timeout=PHOTO_TIMEOUT_S) as resp:
+            body = resp.read(PHOTO_MAX_BYTES + 1)
+    except urllib.error.HTTPError as err:
+        return None, err.code in (408, 429) or err.code >= 500
+    except (urllib.error.URLError, http.client.HTTPException, OSError):
+        return None, True  # connection errors and timeouts
+    if len(body) > PHOTO_MAX_BYTES:
+        return None, False
+    if _sniff_image(body) is None:
+        return None, True  # an interstitial page, not a photo
+    return body, False
+
+
+def _get_photo(url: str) -> bytes | None:
+    """GET ``url`` up to PHOTO_TRIES times, pausing briefly between tries,
+    retrying 429, 5xx, timeouts and connection errors. None when it never
+    worked."""
+    for attempt in range(PHOTO_TRIES):
+        body, retry = _get_photo_once(url)
+        if body is not None:
+            return body
+        if not retry or attempt == PHOTO_TRIES - 1:
+            return None
+        _sleep(PHOTO_BACKOFF_S[min(attempt, len(PHOTO_BACKOFF_S) - 1)])
+    return None
+
+
+_URL_LOCKS: dict[str, threading.Lock] = {}
+_URL_LOCKS_GUARD = threading.Lock()
+
+
+def _url_lock(digest: str) -> threading.Lock:
+    with _URL_LOCKS_GUARD:
+        if len(_URL_LOCKS) > 256:
+            for k in [k for k, v in _URL_LOCKS.items() if not v.locked()]:
+                del _URL_LOCKS[k]
+        return _URL_LOCKS.setdefault(digest, threading.Lock())
+
+
+def _prune_photo_cache(folder: Path) -> None:
+    now = time.time()
+    files = []
+    with contextlib.suppress(OSError):
+        for f in folder.iterdir():
+            with contextlib.suppress(OSError):
+                files.append((f.stat().st_mtime, f))
+    files.sort(key=lambda t: t[0], reverse=True)
+    for i, (mtime, f) in enumerate(files):
+        if i >= PHOTO_CACHE_MAX_FILES or now - mtime >= PHOTO_CACHE_TTL_S:
+            with contextlib.suppress(OSError):
+                f.unlink()
+
+
+def _cached_photo(data_dir: Path, url: str) -> bytes | None:
+    """The bytes of lh3 ``url``: from ``data_dir/photos`` while under an hour
+    old, else fetched (with retries) and stored. Simultaneous requests for one
+    URL, such as a blurred backdrop and its photo, share a single fetch."""
+    folder = data_dir / "photos"
+    digest = hashlib.sha1(url.encode("utf-8")).hexdigest()
+    path = folder / f"{digest}.img"
+
+    def fresh() -> bytes | None:
+        with contextlib.suppress(OSError):
+            if time.time() - path.stat().st_mtime < PHOTO_CACHE_TTL_S:
+                body = path.read_bytes()
+                if _sniff_image(body):
+                    return body
+        return None
+
+    body = fresh()
+    if body is not None:
+        return body
+    with _url_lock(digest):
+        body = fresh()
+        if body is not None:
+            return body
+        body = _get_photo(url)
+        if body is None:
+            return None
+        with contextlib.suppress(OSError):
+            folder.mkdir(parents=True, exist_ok=True)
+            tmp = folder / f"{digest}.{os.getpid()}.{threading.get_ident()}.tmp"
+            tmp.write_bytes(body)
+            os.replace(tmp, path)
+            _prune_photo_cache(folder)
+        return body
+
+
+# The renderer loads the photo over loopback with no session, so the route has
+# to be reachable without one. It is read-only, takes no URL from the caller
+# (the photo comes from this widget's cached manifest) and only ever talks to
+# Google's image host.
+RENDER_SAFE_ENDPOINTS: tuple[str, ...] = ("picture_google_album_photos.photo",)
+
+
+def blueprint() -> Any:
+    from flask import Blueprint, Response, abort, current_app, request
+
+    bp = Blueprint("picture_google_album_photos", __name__)
+
+    @bp.get("/photo/<album>/<key>")
+    def photo(album: str, key: str) -> Response:
+        plugin = current_app.config["PLUGIN_REGISTRY"].get("picture_google_album")
+        if plugin is None:
+            abort(404)
+        found = _find_photo(Path(plugin.data_dir), album, key)
+        if found is None:
+            abort(404)
+        cell = _cell_size({"cell_w": request.args.get("cw"), "cell_h": request.args.get("ch")})
+        body = _cached_photo(Path(plugin.data_dir), _display_url(found, cell))
+        if body is None:
+            resp = Response("Could not fetch the photo from Google.", status=502)
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+        resp = Response(body, mimetype=_sniff_image(body) or "image/jpeg")
+        resp.headers["Cache-Control"] = PHOTO_CACHE_CONTROL
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+
+    return bp
+
+
 # ----- plugin contract ------------------------------------------------
 
 
@@ -534,7 +767,7 @@ def fetch(
 
     cell = _cell_size(ctx)
     return {
-        "url": _display_url(photo, cell),
+        "url": _proxy_url(link, photo, cell),
         "id": photo.get("id"),
         "date": _iso_date(photo.get("taken_ms")),
         "stream": manifest.get("album") or "",
@@ -543,5 +776,5 @@ def fetch(
         "index": index,
         "count": len(filtered),
         # Split view only: a second photo of the same shape as ``url``.
-        "url2": _display_url(second, cell) if second else None,
+        "url2": _proxy_url(link, second, cell) if second else None,
     }
