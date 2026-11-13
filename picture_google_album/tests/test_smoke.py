@@ -320,7 +320,7 @@ def test_options_panel_is_short_and_keeps_saved_cells() -> None:
         (root / "tests" / "options_v0_3_0.json").read_text(encoding="utf-8")
     )
     assert set(old) <= set(by)
-    assert set(by) - set(old) == {"pair_gap", "pair_divider"}
+    assert set(by) - set(old) == {"pair_gap", "pair_divider", "pinned_asset"}
     for name, was in old.items():
         o = by[name]
         assert o["type"] == was["type"] and o.get("default") == was["default"], name
@@ -404,7 +404,11 @@ def test_manifest_lets_lineups_draw_another_photo():
     from pathlib import Path
 
     manifest = json.loads((Path(server.__file__).parent / "plugin.json").read_text())
-    assert manifest["lineups"] == {"draw": True}
+    assert manifest["lineups"] == {
+        "pin_option": "pinned_asset",
+        "noun": "photos",
+        "draw": True,
+    }
 
 
 # ----- photos served through the widget's own route ---------------------
@@ -604,3 +608,125 @@ def test_photo_route_is_render_safe_and_has_no_index():
     rules = {r.rule for r in app.url_map.iter_rules()}
     assert "/plugins/picture_google_album/" not in rules
     assert "picture_google_album_photos.photo" in {r.endpoint for r in app.url_map.iter_rules()}
+
+
+# ----- Lineups items and pin ------------------------------------------
+
+LINK = "https://photos.app.goo.gl/Xy9"
+
+
+def _cache_album(tmp_path, photos):
+    manifest = {
+        "schema": server.MANIFEST_SCHEMA,
+        "album": "Trip",
+        "photos": photos,
+        "fetched_at": 0,
+    }
+    server._write_cache(tmp_path / f"manifest_{server._cache_key(LINK)}.json", manifest)
+
+
+def _no_network(monkeypatch):
+    def boom(url):
+        raise AssertionError("must not fetch")
+
+    monkeypatch.setattr(server, "_get_page", boom)
+
+
+def test_lineup_items_list_cached_photos_with_small_thumbs(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_album(tmp_path, server._parse_photos(SAMPLE_PAGE))
+    ctx = {"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480}
+    items = server.lineup_items({"album": LINK}, ctx=ctx)
+    assert [i["key"] for i in items] == ["AF1QipAbc-123", "AF1QipDef_456"]
+    # Previews come through the widget's own route, as the photo does.
+    assert items[0]["thumb"] == server._proxy_url(LINK, {"id": "AF1QipAbc-123"}, (320, 320))
+    assert items[0]["thumb"].startswith("/plugins/picture_google_album/photo/")
+    assert items[0]["label"] == "2021-04-19"
+    assert server.lineup_item_count({"album": LINK}, ctx=ctx) == 2
+
+
+def test_lineup_items_follow_orientation_and_videos(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    photos = server._parse_photos(SAMPLE_PAGE) + [
+        {**_mk(9, 1920, 1080), "is_video": True}
+    ]
+    _cache_album(tmp_path, photos)
+    ctx = {"data_dir": str(tmp_path)}
+    keys = lambda o: [i["key"] for i in server.lineup_items({"album": LINK, **o}, ctx=ctx)]  # noqa: E731
+    assert keys({"orientation": "portrait"}) == ["AF1QipDef_456"]
+    assert keys({"orientation": "landscape"}) == ["AF1QipAbc-123"]
+    assert keys({"orientation": "landscape", "include_videos": True}) == ["AF1QipAbc-123", "id9"]
+    assert server.lineup_item_count({"album": LINK, "orientation": "square"}, ctx=ctx) is None
+
+
+def test_lineup_items_without_a_cached_album_do_not_wait(tmp_path, monkeypatch):
+    import threading
+
+    release = threading.Event()
+
+    def slow(url):
+        release.wait(5)
+        return "", "", "offline"
+
+    monkeypatch.setattr(server, "_get_page", slow)
+    monkeypatch.setattr(server, "LINEUP_LOAD_BUDGET_S", 0.05)
+    ctx = {"data_dir": str(tmp_path)}
+    assert server.lineup_items({"album": LINK}, ctx=ctx) == []
+    # A second listing while the first load is still running does not pile on.
+    assert server.lineup_items({"album": LINK}, ctx=ctx) == []
+    release.set()
+    assert server.lineup_items({}, ctx=ctx) == []
+    assert server.lineup_items({"album": LINK}) == []
+    assert server.lineup_item_count({"album": LINK}, ctx={}) is None
+
+
+def test_lineup_items_uncached_album_loads_within_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_get_page", lambda url: (SAMPLE_PAGE, url, None))
+    ctx = {"data_dir": str(tmp_path)}
+    assert len(server.lineup_items({"album": LINK}, ctx=ctx)) == 2
+    assert (tmp_path / f"manifest_{server._cache_key(LINK)}.json").exists()
+
+
+def test_legacy_photos_without_an_id_get_a_stable_key(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    legacy = {**_mk(1, 800, 600), "id": None}
+    _cache_album(tmp_path, [legacy])
+    ctx = {"data_dir": str(tmp_path)}
+    key = server.lineup_items({"album": LINK}, ctx=ctx)[0]["key"]
+    assert key == server._photo_key(legacy) and key.startswith("u")
+    out = server.fetch({"album": LINK, "pinned_asset": key}, {}, ctx=ctx)
+    assert out["url"] == server._proxy_url(LINK, legacy, None)
+
+
+def test_pinned_asset_shows_that_photo_and_leaves_the_cursor(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_album(tmp_path, [_mk(n, 1600, 1200) for n in range(4)])
+    ctx = {"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480}
+    seq = {"album": LINK, "mode": "sequential"}
+    assert server.fetch(seq, {}, ctx=ctx)["index"] == 1
+    idx_file = tmp_path / f".seq_idx_{server._cache_key(LINK)}"
+    assert idx_file.read_text() == "0"
+
+    out = server.fetch({**seq, "pinned_asset": "id3"}, {}, ctx=ctx)
+    assert out["id"] == "id3" and out["index"] == 4 and out["count"] == 4
+    assert out["url"] == server._proxy_url(LINK, {"id": "id3"}, (800, 480))  # sized to the cell
+    assert out["url2"] is None
+    assert idx_file.read_text() == "0"
+    assert server.fetch(seq, {}, ctx=ctx)["index"] == 2  # rotation carries on
+
+
+def test_pinned_asset_in_random_mode_is_not_random(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_album(tmp_path, [_mk(n, 1600, 1200) for n in range(6)])
+    opts = {"album": LINK, "mode": "random", "pinned_asset": "id2"}
+    ids = {server.fetch(opts, {}, ctx={"data_dir": str(tmp_path)})["id"] for _ in range(8)}
+    assert ids == {"id2"}
+
+
+def test_unknown_pin_falls_back_to_normal_rotation(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_album(tmp_path, [_mk(n, 1600, 1200) for n in range(3)])
+    opts = {"album": LINK, "mode": "sequential", "pinned_asset": "gone"}
+    out = server.fetch(opts, {}, ctx={"data_dir": str(tmp_path)})
+    assert out["id"] == "id0" and out["index"] == 1 and out["count"] == 3
+    assert server.fetch({**opts, "pinned_asset": "  "}, {}, ctx={"data_dir": str(tmp_path)})["index"] == 2

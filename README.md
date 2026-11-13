@@ -16,7 +16,7 @@ Each photo is requested from Google just big enough to cover the cell it is draw
 
 The page gets each photo from the widget's own route (`/plugins/picture_google_album/photo/…`), not from Google directly. The server fetches it with up to three tries, since Google now and then fails a request for no reason, and keeps it for an hour so a re-render doesn't fetch again.
 
-On the Lineups page, the arrows on a step showing this widget draw another photo (the widget declares `"lineups": {"draw": true}`).
+On the Lineups page the album's photos are listed with a small preview each and a real count, the arrows step through them, and Show chosen pins one (the `pinned_asset` option: that photo is shown instead of rotating, and the sequential position is left alone). The list follows the cell's orientation and video options and is read from the cached album, so it is quick; an album not yet cached is loaded for at most four seconds. The widget declares `"lineups": {"pin_option": "pinned_asset", "noun": "photos", "draw": true}`.
 
 Note: this relies on the share page's markup, which Google could change; the parser has a fallback pattern but may need updating if that happens.
 
