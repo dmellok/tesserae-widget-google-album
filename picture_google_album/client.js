@@ -13,6 +13,16 @@ function fmtDate(iso) {
   return iso.slice(0, 10);
 }
 
+// The photo URL is a path on this Tesserae server. Behind Home Assistant's
+// ingress the page itself sits under /api/hassio_ingress/<token>, so a bare
+// "/plugins/..." would miss the app; add that prefix. Anything already
+// prefixed, or not an app path (http(s), data:), is left alone.
+function appUrl(u) {
+  if (typeof u !== "string" || !u.startsWith("/") || u.startsWith("//")) return u;
+  const m = /^\/api\/hassio_ingress\/[^/]+/.exec(globalThis.location?.pathname || "");
+  return m && !u.startsWith(m[0] + "/") ? m[0] + u : u;
+}
+
 const PAIR_DIVIDER = { background: "var(--surface-sunken)", white: "#fff", black: "#000" };
 const OBJECT_FIT = { fit: "contain", fill: "cover", stretch: "fill", blurred: "contain" };
 
@@ -64,7 +74,7 @@ export default function render(shadow, ctx) {
     && cellShape && photoShape && cellShape !== photoShape
     && cellShape !== "square" && photoShape !== "square"
     ? (cellShape === "landscape" ? "row" : "column") : null;
-  const urls = (pairLayout ? [data.url, data.url2] : [data.url]).map(escapeHtml);
+  const urls = (pairLayout ? [data.url, data.url2] : [data.url]).map((u) => escapeHtml(appUrl(u)));
   const paired = pairLayout !== null;
   const tile = (u) => `<div class="tile">${scale === "blurred"
     ? `<img class="backdrop" src="${u}" alt="" aria-hidden="true">` : ""}
