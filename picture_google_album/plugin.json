@@ -20,10 +20,11 @@
   "cell_options": [
     {
       "name": "album",
+      "placeholder": "https://photos.app.goo.gl/AbCdEfGhijkLmN2p9",
       "type": "string",
       "label": "Album link",
       "default": "",
-      "help": "The shared album's link, such as https://photos.app.goo.gl/..."
+      "help": "In Google Photos, open the album, choose Share, then Create link. Paste the complete photos.app.goo.gl link or photos.google.com/share/ link, including its query string. Preserve capitals; use plain text."
     },
     {
       "name": "mode",
@@ -122,6 +123,7 @@
     },
     {
       "name": "pair_gap",
+      "placeholder": "2",
       "type": "number",
       "label": "Gap between pair",
       "default": 2,

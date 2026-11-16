@@ -20,7 +20,7 @@ SAMPLE_PAGE = (
 def test_empty_options_returns_friendly_error():
     out = server.fetch({}, {}, ctx={})
     assert out["url"] is None
-    assert "photos.app.goo.gl" in out["error"]
+    assert "cell editor" in out["error"]
 
 
 def test_share_url_normalisation():
