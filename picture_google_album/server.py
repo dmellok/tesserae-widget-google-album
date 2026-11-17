@@ -826,10 +826,7 @@ def fetch(
     link = _share_url(options.get("album") or "")
     if not link:
         return {
-            "error": "Paste a Google Photos shared-album link "
-            "(https://photos.app.goo.gl/… or "
-            "https://photos.google.com/share/…). In Google Photos: open the "
-            "album, Share, then 'Create link'.",
+            "error": "Paste the album's share link in the cell editor.",
             "url": None,
         }
 
