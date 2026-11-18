@@ -813,14 +813,20 @@ def test_split_view_is_unchanged_by_frame_shapes(tmp_path, monkeypatch):
     assert _drawn(tmp_path, {"orientation": "splitview"}, **ctx) == {"idL1", "idP1", "idS1"}
 
 
-def test_lineups_list_auto_and_frame_as_any(tmp_path, monkeypatch):
+def test_lineups_list_only_what_each_frame_is_shown(tmp_path, monkeypatch):
     _no_network(monkeypatch)
     _mixed_album(tmp_path)
-    ctx = {"data_dir": str(tmp_path), "frame_shapes": BOTH, "cell_w": 800, "cell_h": 480}
-    for orientation in ("auto", "frame", "any"):
+    wide = {"data_dir": str(tmp_path), "frame_shapes": BOTH, "cell_w": 800, "cell_h": 480}
+    tall = {**wide, "cell_w": 480, "cell_h": 800}
+    for orientation in ("auto", "frame", None):  # None: a cell that saved no orientation
         opts = {"album": LINK, "orientation": orientation}
-        assert [i["key"] for i in server.lineup_items(opts, ctx=ctx)] == ["idL1", "idP1", "idS1"]
-        assert server.lineup_item_count(opts, ctx=ctx) == 3
+        assert [i["key"] for i in server.lineup_items(opts, ctx=wide)] == ["idL1", "idS1"]
+        assert [i["key"] for i in server.lineup_items(opts, ctx=tall)] == ["idP1", "idS1"]
+        assert server.lineup_item_count(opts, ctx=wide) == 2
+    any_opts = {"album": LINK, "orientation": "any"}
+    assert server.lineup_item_count(any_opts, ctx=wide) == 3
+    one_shape = {**wide, "frame_shapes": ["landscape"]}
+    assert server.lineup_item_count({"album": LINK, "orientation": "auto"}, ctx=one_shape) == 3
 
 
 def test_pinned_photo_ignores_match_the_frame(tmp_path, monkeypatch):

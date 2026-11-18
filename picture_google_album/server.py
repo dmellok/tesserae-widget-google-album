@@ -761,12 +761,20 @@ def _pinned_photo(options: dict[str, Any], photos: list[dict[str, Any]]) -> dict
     return next((p for p in photos if _photo_key(p) == key), None)
 
 
-def _candidates(options: dict[str, Any], photos: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """The photos the widget draws from under these options: videos only when
-    asked for, then the orientation filter (split view takes them all)."""
+def _candidates(
+    options: dict[str, Any], photos: list[dict[str, Any]], ctx: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """The photos the widget draws from under these options on this frame:
+    videos only when asked for, then the orientation filter (split view takes
+    them all; Auto and Match the frame use ``ctx``'s cell size and frame
+    shapes, as a render does). Unset reads as the default, Auto: a render gets
+    it filled in, a Lineups listing reads the saved options as they are."""
     if not options.get("include_videos"):
         photos = [p for p in photos if not p.get("is_video")]
-    orientation = (options.get("orientation") or "any").lower()
+    orientation = (options.get("orientation") or "auto").lower()
+    shape = _frame_shape(orientation, ctx or {})
+    if shape:
+        return _match_frame(photos, shape)
     return photos if orientation == "splitview" else _filter_orientation(photos, orientation)
 
 
@@ -816,7 +824,7 @@ def _lineup_photos(options: dict[str, Any], ctx: dict[str, Any] | None) -> list[
         return []
     seen: set[str] = set()
     out = []
-    for p in _candidates(options, manifest.get("photos") or []):
+    for p in _candidates(options, manifest.get("photos") or [], ctx):
         key = _photo_key(p)
         if key not in seen:
             seen.add(key)
@@ -880,7 +888,7 @@ def fetch(
     if pinned is not None:
         # A photo chosen from Lineups: show exactly it. Nothing below runs, so
         # the sequential cursor and the draw are left where they were.
-        pool = _candidates(options, photos) or photos
+        pool = _candidates(options, photos, ctx) or photos
         shown = next((i for i, p in enumerate(pool) if p is pinned), None)
         if shown is None:
             pool, shown = photos, photos.index(pinned)
