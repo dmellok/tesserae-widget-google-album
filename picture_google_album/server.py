@@ -431,9 +431,47 @@ def _orientation_of(p: dict[str, Any]) -> str:
 def _filter_orientation(
     photos: list[dict[str, Any]], wanted: str
 ) -> list[dict[str, Any]]:
-    if wanted == "any":
+    # Auto and Match the frame depend on the frame, so lists that are not per
+    # frame (Lineups) treat them as Any; fetch narrows them per render.
+    if wanted in ("any", "auto", "frame"):
         return photos
     return [p for p in photos if _orientation_of(p) == wanted]
+
+
+def _cell_shape(ctx: dict[str, Any]) -> str | None:
+    """``landscape`` or ``portrait`` for the cell being drawn (``cell_w`` /
+    ``cell_h``, else ``panel_w`` / ``panel_h``); None when square or unknown."""
+
+    def size(wk: str, hk: str) -> tuple[int, int]:
+        try:
+            return int(ctx.get(wk) or 0), int(ctx.get(hk) or 0)
+        except (TypeError, ValueError):
+            return 0, 0
+
+    w, h = size("cell_w", "cell_h")
+    if w <= 0 or h <= 0:
+        w, h = size("panel_w", "panel_h")
+    if w <= 0 or h <= 0 or w == h:
+        return None
+    return "landscape" if w > h else "portrait"
+
+
+def _frame_shape(orientation: str, ctx: dict[str, Any]) -> str | None:
+    """The shape Match the frame narrows this render to, or None for no
+    filter. Auto matches the frame only when the dashboard is on both
+    portrait and landscape frames (``frame_shapes``)."""
+    if orientation == "auto":
+        shapes = ctx.get("frame_shapes")
+        if not isinstance(shapes, (list, tuple, set)) or not {"landscape", "portrait"} <= set(shapes):
+            return None
+    elif orientation != "frame":
+        return None
+    return _cell_shape(ctx)
+
+
+def _match_frame(photos: list[dict[str, Any]], shape: str) -> list[dict[str, Any]]:
+    """Photos of the frame's shape plus square ones; all of them when none fit."""
+    return [p for p in photos if _orientation_of(p) in (shape, "square")] or photos
 
 
 def _pick_split(
@@ -870,14 +908,20 @@ def fetch(
     # Split view draws from the whole album; the client decides per cell
     # whether the drawn photo is shown alone or with its mate.
     split = orientation == "splitview"
-    filtered = photos if split else _filter_orientation(photos, orientation)
+    shape = _frame_shape(orientation, ctx)
+    if shape:
+        filtered = _match_frame(photos, shape)
+    else:
+        filtered = photos if split else _filter_orientation(photos, orientation)
     if not filtered:
         return {"error": f"No {orientation} photos in this album.", "url": None}
 
     mode = options.get("mode", "random")
     second = None
     if mode == "sequential":
-        suffix = f"_{orientation}" if orientation not in ("any", "splitview") else ""
+        # One position per set of photos: each frame shape keeps its own.
+        seq = f"frame_{shape}" if shape else orientation
+        suffix = f"_{seq}" if seq not in ("any", "auto", "frame", "splitview") else ""
         idx_file = data_dir / f".seq_idx_{_cache_key(link)}{suffix}"
         try:
             current = int(idx_file.read_text(encoding="utf-8"))

@@ -46,8 +46,16 @@
       "name": "orientation",
       "type": "select",
       "label": "Orientation",
-      "default": "any",
+      "default": "auto",
       "choices": [
+        {
+          "value": "auto",
+          "label": "Auto"
+        },
+        {
+          "value": "frame",
+          "label": "Match the frame"
+        },
         {
           "value": "any",
           "label": "Any"
@@ -69,7 +77,7 @@
           "label": "Split view"
         }
       ],
-      "help": "Only photos of this shape. Split view shows a portrait photo as a pair in a landscape cell, or a landscape photo as a pair in a portrait cell. Square photos and near-square cells are never paired. Split view pairs only with random selection."
+      "help": "Auto matches each frame's shape when the dashboard is on both portrait and landscape frames, and shows any photo otherwise. Match the frame always does. Portrait, Landscape and Square show only photos of that shape. Split view shows a portrait photo as a pair in a landscape cell, or a landscape photo as a pair in a portrait cell. Square photos and near-square cells are never paired. Split view pairs only with random selection."
     },
     {
       "name": "scale",
