@@ -323,8 +323,19 @@ def test_options_panel_is_short_and_keeps_saved_cells() -> None:
     assert set(by) - set(old) == {"pair_gap", "pair_divider", "pinned_asset"}
     for name, was in old.items():
         o = by[name]
-        assert o["type"] == was["type"] and o.get("default") == was["default"], name
-        assert [c["value"] for c in o.get("choices", [])][: len(was["values"])] == was["values"], name
+        values = [c["value"] for c in o.get("choices", [])]
+        if name == "orientation":
+            # Auto and Match the frame lead the list and Auto is the new default;
+            # every value a saved cell can hold is still there, in order.
+            assert values[:2] == ["auto", "frame"] and o["default"] == "auto"
+            values = values[2:]
+        else:
+            assert o.get("default") == was["default"], name
+        # The album link became a textarea (several links, one per line);
+        # it still saves a plain string, so old cells load unchanged.
+        types = {"string", "textarea"} if name == "album" else {was["type"]}
+        assert o["type"] in types, name
+        assert values[: len(was["values"])] == was["values"], name
     assert "—" not in json.dumps(m, ensure_ascii=False)
 
 
@@ -730,3 +741,223 @@ def test_unknown_pin_falls_back_to_normal_rotation(tmp_path, monkeypatch):
     out = server.fetch(opts, {}, ctx={"data_dir": str(tmp_path)})
     assert out["id"] == "id0" and out["index"] == 1 and out["count"] == 3
     assert server.fetch({**opts, "pinned_asset": "  "}, {}, ctx={"data_dir": str(tmp_path)})["index"] == 2
+
+
+# ----- several albums in one cell ---------------------------------------
+
+LINK_A = "https://photos.app.goo.gl/AlbumA"
+LINK_B = "https://photos.app.goo.gl/AlbumB"
+
+
+def _cache_named(tmp_path, link, title, photos):
+    manifest = {"schema": server.MANIFEST_SCHEMA, "album": title, "photos": photos, "fetched_at": 0}
+    server._write_cache(tmp_path / f"manifest_{server._cache_key(link)}.json", manifest)
+
+
+def test_share_urls_split_on_lines_commas_and_spaces():
+    raw = f" {LINK_A}\n\nphotos.google.com/share/AF1?key=k , Xy9  {LINK_A}\r\n"
+    assert server._share_urls(raw) == [
+        LINK_A,
+        "https://photos.google.com/share/AF1?key=k",
+        "https://photos.app.goo.gl/Xy9",
+    ]
+    assert server._share_urls(f"  {LINK_A}  ") == [LINK_A]
+    assert server._share_urls("") == [] and server._share_urls(None) == []
+
+
+def test_parse_keeps_the_content_hash_for_dedupe():
+    photos, _ = server._photos_from_page(JSON_PAGE, "")
+    assert "dedup_key" not in photos[0]  # "tok1" is too short to be a hash
+    entry = ["AF1QipX", ["https://lh3.googleusercontent.com/pw/X", 800, 600], 1, "7LkuNX54bkkDmvdyxric9R2V65U"]
+    assert server._photo_from_entry(entry)["dedup_key"] == "7LkuNX54bkkDmvdyxric9R2V65U"
+
+
+def test_union_dedupes_across_albums(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    shared = _mk("S", 1600, 1200)
+    same_file = {**_mk("S2", 1600, 1200), "dedup_key": "H" * 27}
+    _cache_named(tmp_path, LINK_A, "Alpha", [_mk("A1", 1600, 1200), shared, {**_mk("A2", 1600, 1200), "dedup_key": "H" * 27}])
+    _cache_named(tmp_path, LINK_B, "Beta", [shared, same_file, _mk("B1", 900, 1600)])
+    opts = {"album": f"{LINK_A}\n{LINK_B}", "mode": "sequential"}
+    ctx = {"data_dir": str(tmp_path)}
+    seen = [server.fetch(opts, {}, ctx=ctx) for _ in range(4)]
+    assert [o["id"] for o in seen] == ["idA1", "idS", "idA2", "idB1"]
+    assert {o["count"] for o in seen} == {4}
+    # Caption names each photo's own album, and the photo is served from it.
+    assert [o["stream"] for o in seen] == ["Alpha", "Alpha", "Alpha", "Beta"]
+    assert seen[3]["url"] == server._proxy_url(LINK_B, {"id": "idB1"}, None)
+    assert seen[0]["url"] == server._proxy_url(LINK_A, {"id": "idA1"}, None)
+    assert server.fetch(opts, {}, ctx=ctx)["id"] == "idA1"  # wraps
+
+
+def test_random_draw_makes_every_photo_equally_likely(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_named(tmp_path, LINK_A, "Big", [_mk(f"A{n}", 1600, 1200) for n in range(9)])
+    _cache_named(tmp_path, LINK_B, "Small", [_mk("B0", 1600, 1200)])
+    pools = []
+    monkeypatch.setattr(server.random, "choice", lambda seq: pools.append(list(seq)) or seq[0])
+    out = server.fetch({"album": f"{LINK_A},{LINK_B}"}, {}, ctx={"data_dir": str(tmp_path)})
+    # One flat pool of all ten photos: the small album's photo is 1 in 10,
+    # not 1 in 2 as a per-album draw would make it.
+    assert len(pools) == 1 and len(pools[0]) == 10
+    assert len({p["id"] for p in pools[0]}) == 10
+    assert out["count"] == 10
+
+
+def test_one_failing_album_does_not_blank_the_cell(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_get_page", lambda url: ("", "", "Google returned HTTP 404 for the share link."))
+    _cache_named(tmp_path, LINK_A, "Alpha", [_mk("A1", 1600, 1200)])
+    ctx = {"data_dir": str(tmp_path)}
+    out = server.fetch({"album": f"{LINK_A}\n{LINK_B}"}, {}, ctx=ctx)
+    assert out["id"] == "idA1" and out["count"] == 1 and out["stream"] == "Alpha"
+    both_bad = server.fetch({"album": f"{LINK_B} https://photos.app.goo.gl/Gone"}, {}, ctx=ctx)
+    assert both_bad["url"] is None and "HTTP 404" in both_bad["error"]
+
+
+def test_single_link_keeps_its_cursor_file(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_named(tmp_path, LINK_A, "Alpha", [_mk(n, 1600, 1200) for n in range(3)])
+    server.fetch({"album": f"{LINK_A}\n", "mode": "sequential"}, {}, ctx={"data_dir": str(tmp_path)})
+    assert (tmp_path / f".seq_idx_{server._cache_key(LINK_A)}").read_text() == "0"
+
+
+def test_several_albums_filter_orientation_and_split(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_named(tmp_path, LINK_A, "Alpha", [_mk("A1", 1600, 1200), _mk("AP", 900, 1600)])
+    _cache_named(tmp_path, LINK_B, "Beta", [_mk("BP", 900, 1600)])
+    ctx = {"data_dir": str(tmp_path)}
+    both = f"{LINK_A}\n{LINK_B}"
+    out = server.fetch({"album": both, "orientation": "portrait", "mode": "sequential"}, {}, ctx=ctx)
+    assert out["id"] == "idAP" and out["count"] == 2
+    none = server.fetch({"album": both, "orientation": "square"}, {}, ctx=ctx)
+    assert none["error"] == "No square photos in these albums."
+    monkeypatch.setattr(server.random, "randrange", lambda n: 1)  # AP
+    split = server.fetch({"album": both, "orientation": "splitview"}, {}, ctx=ctx)
+    assert split["id"] == "idAP"
+    assert split["url2"] == server._proxy_url(LINK_B, {"id": "idBP"}, None)
+
+
+def test_pin_finds_a_photo_in_the_second_album(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_named(tmp_path, LINK_A, "Alpha", [_mk("A1", 1600, 1200)])
+    _cache_named(tmp_path, LINK_B, "Beta", [_mk("B1", 1600, 1200)])
+    out = server.fetch({"album": f"{LINK_A}\n{LINK_B}", "pinned_asset": "idB1"}, {}, ctx={"data_dir": str(tmp_path)})
+    assert out["id"] == "idB1" and out["stream"] == "Beta" and out["index"] == 2 and out["count"] == 2
+    assert out["url"] == server._proxy_url(LINK_B, {"id": "idB1"}, None)
+
+
+def test_lineups_list_the_union_once(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    shared = _mk("S", 1600, 1200)
+    _cache_named(tmp_path, LINK_A, "Alpha", [_mk("A1", 1600, 1200), shared])
+    _cache_named(tmp_path, LINK_B, "Beta", [shared, _mk("B1", 1600, 1200)])
+    ctx = {"data_dir": str(tmp_path)}
+    opts = {"album": f"{LINK_A}\n{LINK_B}"}
+    items = server.lineup_items(opts, ctx=ctx)
+    assert [i["key"] for i in items] == ["idA1", "idS", "idB1"]
+    assert items[2]["thumb"] == server._proxy_url(LINK_B, {"id": "idB1"}, (320, 320))
+    assert server.lineup_item_count(opts, ctx=ctx) == 3
+
+
+def test_lineups_skip_an_album_that_will_not_load(tmp_path, monkeypatch):
+    monkeypatch.setattr(server, "_get_page", lambda url: ("", "", "offline"))
+    _cache_named(tmp_path, LINK_A, "Alpha", [_mk("A1", 1600, 1200)])
+    ctx = {"data_dir": str(tmp_path)}
+    assert server.lineup_item_count({"album": f"{LINK_A}\n{LINK_B}"}, ctx=ctx) == 1
+
+
+# ----- Auto and Match the frame ---------------------------------------
+
+BOTH = ["landscape", "portrait"]
+
+
+def _mixed_album(tmp_path):
+    photos = [_mk("L1", 1600, 900), _mk("P1", 900, 1600), _mk("S1", 1000, 1000)]
+    _cache_album(tmp_path, photos)
+
+
+def _drawn(tmp_path, options, **ctx):
+    """The ids fetch draws over many renders."""
+    ctx = {"data_dir": str(tmp_path), **ctx}
+    return {server.fetch({"album": LINK, **options}, {}, ctx=ctx)["id"] for _ in range(60)}
+
+
+def test_auto_on_mixed_frames_matches_the_cell(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    opts = {"orientation": "auto"}
+    assert _drawn(tmp_path, opts, frame_shapes=BOTH, cell_w=800, cell_h=480) == {"idL1", "idS1"}
+    assert _drawn(tmp_path, opts, frame_shapes=BOTH, cell_w=480, cell_h=800) == {"idP1", "idS1"}
+    # Unknown cell size: the panel's decides.
+    assert _drawn(tmp_path, opts, frame_shapes=BOTH, cell_w=0, cell_h=0, panel_w=480, panel_h=800) == {"idP1", "idS1"}
+    # Square cell: no shape to match.
+    assert _drawn(tmp_path, opts, frame_shapes=BOTH, cell_w=600, cell_h=600) == {"idL1", "idP1", "idS1"}
+
+
+def test_auto_is_any_on_one_frame_shape_or_none(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    everything = {"idL1", "idP1", "idS1"}
+    for opts in ({"orientation": "auto"}, {}):  # Auto is the default
+        assert _drawn(tmp_path, opts, frame_shapes=["landscape"], cell_w=800, cell_h=480) == everything
+        assert _drawn(tmp_path, opts, cell_w=800, cell_h=480) == everything
+
+
+def test_match_the_frame_filters_on_any_frame(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    opts = {"orientation": "frame"}
+    assert _drawn(tmp_path, opts, cell_w=800, cell_h=480) == {"idL1", "idS1"}
+    assert _drawn(tmp_path, opts, frame_shapes=["portrait"], cell_w=480, cell_h=800) == {"idP1", "idS1"}
+    out = server.fetch({"album": LINK, **opts}, {}, ctx={"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480})
+    assert out["count"] == 2
+
+
+def test_match_the_frame_falls_back_to_the_whole_album(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_album(tmp_path, [_mk("P1", 900, 1600), _mk("P2", 900, 1600)])
+    for orientation in ("frame", "auto"):
+        ctx = {"data_dir": str(tmp_path), "frame_shapes": BOTH, "cell_w": 800, "cell_h": 480}
+        out = server.fetch({"album": LINK, "orientation": orientation}, {}, ctx=ctx)
+        assert "error" not in out and out["count"] == 2
+
+
+def test_match_the_frame_keeps_a_sequence_per_frame_shape(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_album(tmp_path, [_mk("L1", 1600, 900), _mk("P1", 900, 1600), _mk("L2", 1600, 900)])
+    wide = {"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480}
+    tall = {**wide, "cell_w": 480, "cell_h": 800}
+    opts = {"album": LINK, "orientation": "frame", "mode": "sequential"}
+    ids = [server.fetch(opts, {}, ctx=c)["id"] for c in (wide, tall, wide, tall)]
+    assert ids == ["idL1", "idP1", "idL2", "idP1"]
+
+
+def test_split_view_is_unchanged_by_frame_shapes(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    ctx = {"frame_shapes": BOTH, "cell_w": 800, "cell_h": 480}
+    assert _drawn(tmp_path, {"orientation": "splitview"}, **ctx) == {"idL1", "idP1", "idS1"}
+
+
+def test_lineups_list_only_what_each_frame_is_shown(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    wide = {"data_dir": str(tmp_path), "frame_shapes": BOTH, "cell_w": 800, "cell_h": 480}
+    tall = {**wide, "cell_w": 480, "cell_h": 800}
+    for orientation in ("auto", "frame", None):  # None: a cell that saved no orientation
+        opts = {"album": LINK, "orientation": orientation}
+        assert [i["key"] for i in server.lineup_items(opts, ctx=wide)] == ["idL1", "idS1"]
+        assert [i["key"] for i in server.lineup_items(opts, ctx=tall)] == ["idP1", "idS1"]
+        assert server.lineup_item_count(opts, ctx=wide) == 2
+    any_opts = {"album": LINK, "orientation": "any"}
+    assert server.lineup_item_count(any_opts, ctx=wide) == 3
+    one_shape = {**wide, "frame_shapes": ["landscape"]}
+    assert server.lineup_item_count({"album": LINK, "orientation": "auto"}, ctx=one_shape) == 3
+
+
+def test_pinned_photo_ignores_match_the_frame(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    ctx = {"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480}
+    out = server.fetch({"album": LINK, "orientation": "frame", "pinned_asset": "idP1"}, {}, ctx=ctx)
+    assert out["id"] == "idP1"
