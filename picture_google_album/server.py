@@ -18,6 +18,12 @@ Accepted inputs for the "album" option:
   https://photos.google.com/share/AF1Qip...?key=...
   XXXX                                    (bare short-link code)
 
+Several links (one per line, or separated by commas or spaces) mix those
+albums in one cell. Each album keeps its own manifest cache; the cell draws
+from their union, with a photo found in two albums counted once, so every
+photo is equally likely. Sequential walks the albums in the order listed.
+An album that fails to load is left out while the others still show.
+
 Videos in the album are listed on the same page with an lh3 poster-frame
 URL; they are detected by the video-info key in each entry's trailing
 metadata and skipped unless the include_videos option is on.
@@ -121,6 +127,9 @@ DATA_CALLBACK_RE = re.compile(
 # An entry is ~0.5-1.5 KB; cap the balanced-bracket walk well above that
 # so a malformed page can't make us scan to EOF per entry.
 ENTRY_SCAN_CAP = 100_000
+DEDUP_KEY_RE = re.compile(r"^[\w-]{20,64}$")
+# At most this many albums of one cell load from Google at once.
+ALBUM_LOAD_WORKERS = 4
 
 
 # ----- share-link normalisation --------------------------------------
@@ -136,6 +145,17 @@ def _share_url(raw: str) -> str:
         return f"https://{s}"
     # Bare short-link code (the bit after photos.app.goo.gl/).
     return f"https://photos.app.goo.gl/{s}"
+
+
+def _share_urls(raw: Any) -> list[str]:
+    """Every album link in the option, in order, without repeats. Links are
+    separated by new lines, commas or spaces; none of them contain those."""
+    links: list[str] = []
+    for part in re.split(r"[\s,]+", str(raw or "")):
+        link = _share_url(part)
+        if link and link not in links:
+            links.append(link)
+    return links
 
 
 # ----- HTTP + parse ---------------------------------------------------
@@ -248,7 +268,7 @@ def _photo_from_entry(entry: Any) -> dict[str, Any] | None:
         return None
     if not url.startswith("https://lh3.googleusercontent.com/"):
         return None
-    return {
+    photo = {
         "id": pid,
         "base": url,
         "width": w,
@@ -256,6 +276,13 @@ def _photo_from_entry(entry: Any) -> dict[str, Any] | None:
         "taken_ms": int(ts) if isinstance(ts, (int, float)) else None,
         "is_video": _entry_is_video(entry),
     }
+    # entry[3] is the file's content hash (url-safe base64 SHA-1). The same
+    # file shared into two albums gets a different id and lh3 URL in each,
+    # but this hash, so it is how a mix of albums counts it once.
+    dedup = entry[3] if len(entry) > 3 else None
+    if isinstance(dedup, str) and DEDUP_KEY_RE.match(dedup):
+        photo["dedup_key"] = dedup
+    return photo
 
 
 def _album_payload(page: str) -> list[Any] | None:
@@ -412,6 +439,59 @@ def _load_manifest(
     }
     _write_cache(cache_path, manifest)
     return manifest, None
+
+
+def _load_albums(
+    links: list[str], data_dir: Path
+) -> tuple[list[tuple[str, dict[str, Any]]], str | None]:
+    """(link, manifest) for every album that loaded, in link order, and the
+    first album's error when one failed. Several albums load side by side,
+    each in a copy of this call's context so the host's network allowlist
+    applies in the worker too."""
+    if len(links) == 1:
+        results = [_load_manifest(links[0], data_dir)]
+    else:
+
+        def load(link: str) -> tuple[dict[str, Any] | None, str | None]:
+            try:
+                return _load_manifest(link, data_dir)
+            except Exception as err:  # one bad album must not sink the rest
+                return None, f"Could not load the album: {err}"[:200]
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(ALBUM_LOAD_WORKERS, len(links))) as pool:
+            futures = [
+                pool.submit(contextvars.copy_context().run, load, link) for link in links
+            ]
+            results = [f.result() for f in futures]
+    albums = [(link, m) for link, (m, _) in zip(links, results) if m is not None]
+    err = next((e for _, e in results if e), None)
+    return albums, err
+
+
+def _union(albums: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
+    """The photos of all ``albums`` in one list, album by album, each tagged
+    with the link and title of the album it came from. With several albums,
+    a photo already listed (same file, id or URL) is skipped, so each photo
+    is in the list, and so drawn, once."""
+    multi = len(albums) > 1
+    seen: set[tuple[str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for link, manifest in albums:
+        title = manifest.get("album") or ""
+        for p in manifest.get("photos") or []:
+            if multi:
+                keys = {
+                    (k, str(p[k]))
+                    for k in ("dedup_key", "id", "base")
+                    if p.get(k)
+                }
+                if keys & seen:
+                    continue
+                seen |= keys
+            out.append({**p, "_link": link, "_album": title})
+    return out
 
 
 # ----- selection helpers ----------------------------------------------
@@ -782,15 +862,39 @@ _LOADING: set[str] = set()
 _LOADING_LOCK = threading.Lock()
 
 
-def _lineup_manifest(link: str, data_dir: Path) -> dict[str, Any] | None:
-    """The album's manifest for a Lineups listing: the cached one however old
-    (a render refreshes it), else one load held to LINEUP_LOAD_BUDGET_S. A
-    load that outlasts the budget keeps running and fills the cache."""
-    path = data_dir / f"manifest_{_cache_key(link)}.json"
-    with contextlib.suppress(OSError, json.JSONDecodeError):
-        cached = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(cached, dict) and cached.get("schema") == MANIFEST_SCHEMA:
-            return cached
+def _lineup_manifests(
+    links: list[str], data_dir: Path
+) -> list[tuple[str, dict[str, Any]]]:
+    """(link, manifest) for each album of a Lineups listing: the cached one
+    however old (a render refreshes it), else a load. Uncached albums load
+    side by side, all held to one LINEUP_LOAD_BUDGET_S; a load that outlasts
+    it keeps running and fills the cache."""
+    found: dict[str, dict[str, Any]] = {}
+    pending = []
+    for link in links:
+        path = data_dir / f"manifest_{_cache_key(link)}.json"
+        with contextlib.suppress(OSError, json.JSONDecodeError):
+            cached = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(cached, dict) and cached.get("schema") == MANIFEST_SCHEMA:
+                found[link] = cached
+                continue
+        started = _start_lineup_load(link, data_dir)
+        if started is not None:
+            pending.append((link, *started))
+    deadline = time.monotonic() + LINEUP_LOAD_BUDGET_S
+    for link, worker, result in pending:
+        worker.join(max(0.0, deadline - time.monotonic()))
+        if result and result[0] is not None:
+            found[link] = result[0]
+    return [(link, found[link]) for link in links if link in found]
+
+
+def _start_lineup_load(
+    link: str, data_dir: Path
+) -> tuple[threading.Thread, list[dict[str, Any] | None]] | None:
+    """Start loading one album in the background, or None when a load of it
+    is already running. The list fills with the manifest (or None) when the
+    load ends."""
     result: list[dict[str, Any] | None] = []
 
     def load() -> None:
@@ -810,21 +914,20 @@ def _lineup_manifest(link: str, data_dir: Path) -> dict[str, Any] | None:
     # for the widget applies in the worker as it does here.
     worker = threading.Thread(target=contextvars.copy_context().run, args=(load,), daemon=True)
     worker.start()
-    worker.join(LINEUP_LOAD_BUDGET_S)
-    return result[0] if result else None
+    return worker, result
 
 
 def _lineup_photos(options: dict[str, Any], ctx: dict[str, Any] | None) -> list[dict[str, Any]]:
-    link = _share_url(str(options.get("album") or ""))
+    links = _share_urls(options.get("album"))
     data_dir = (ctx or {}).get("data_dir")
-    if not link or not data_dir:
+    if not links or not data_dir:
         return []
-    manifest = _lineup_manifest(link, Path(str(data_dir)))
-    if not manifest:
+    albums = _lineup_manifests(links, Path(str(data_dir)))
+    if not albums:
         return []
     seen: set[str] = set()
     out = []
-    for p in _candidates(options, manifest.get("photos") or [], ctx):
+    for p in _candidates(options, _union(albums), ctx):
         key = _photo_key(p)
         if key not in seen:
             seen.add(key)
@@ -836,9 +939,9 @@ def lineup_items(
     options: dict[str, Any], *, ctx: dict[str, Any] | None = None
 ) -> list[dict[str, str]]:
     """The album's photos for the Lineups page, with a small preview each.
-    Read from the cached manifest (see ``_lineup_manifest``); empty when the
-    album is unknown or can't be loaded in time."""
-    link = _share_url(str(options.get("album") or ""))
+    Read from the cached manifests (see ``_lineup_manifests``); empty when the
+    album is unknown or can't be loaded in time. With several albums, their
+    photos together, each once."""
     items = []
     for n, p in enumerate(_lineup_photos(options, ctx), 1):
         taken = _iso_date(p.get("taken_ms"))
@@ -848,7 +951,7 @@ def lineup_items(
                 "label": taken[:10] if taken else f"Photo {n}",
                 # Through the widget's own route, like the photo itself:
                 # the browser never hotlinks lh3.
-                "thumb": _proxy_url(link, p, (LINEUP_THUMB_BOX, LINEUP_THUMB_BOX)),
+                "thumb": _proxy_url(p["_link"], p, (LINEUP_THUMB_BOX, LINEUP_THUMB_BOX)),
             }
         )
     return items
@@ -869,8 +972,8 @@ def fetch(
     options: dict[str, Any], settings: dict[str, Any], *, ctx: dict[str, Any]
 ) -> dict[str, Any]:
     del settings
-    link = _share_url(options.get("album") or "")
-    if not link:
+    links = _share_urls(options.get("album"))
+    if not links:
         return {
             "error": "Paste the album's share link in the cell editor.",
             "url": None,
@@ -879,11 +982,12 @@ def fetch(
     data_dir = Path(ctx.get("data_dir") or ".")
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    manifest, err = _load_manifest(link, data_dir)
-    if err or manifest is None:
+    albums, err = _load_albums(links, data_dir)
+    if not albums:
         return {"error": err or "Could not load the album.", "url": None}
+    where = "this album" if len(links) == 1 else "these albums"
 
-    photos = manifest.get("photos") or []
+    photos = _union(albums)
     pinned = _pinned_photo(options, photos)
     if pinned is not None:
         # A photo chosen from Lineups: show exactly it. Nothing below runs, so
@@ -893,10 +997,10 @@ def fetch(
         if shown is None:
             pool, shown = photos, photos.index(pinned)
         return {
-            "url": _proxy_url(link, pinned, _cell_size(ctx)),
+            "url": _proxy_url(pinned["_link"], pinned, _cell_size(ctx)),
             "id": pinned.get("id"),
             "date": _iso_date(pinned.get("taken_ms")),
-            "stream": manifest.get("album") or "",
+            "stream": pinned["_album"],
             "width": pinned.get("width"),
             "height": pinned.get("height"),
             "index": shown + 1,
@@ -907,13 +1011,16 @@ def fetch(
         stills = [p for p in photos if not p.get("is_video")]
         if not stills and photos:
             return {
-                "error": "This album only contains videos. Enable "
-                "'Include videos' to show their still frames.",
+                "error": (
+                    "This album only contains" if len(links) == 1
+                    else "These albums only contain"
+                )
+                + " videos. Enable 'Include videos' to show their still frames.",
                 "url": None,
             }
         photos = stills
     orientation = (options.get("orientation") or "any").lower()
-    # Split view draws from the whole album; the client decides per cell
+    # Split view draws from every photo; the client decides per cell
     # whether the drawn photo is shown alone or with its mate.
     split = orientation == "splitview"
     shape = _frame_shape(orientation, ctx)
@@ -922,7 +1029,7 @@ def fetch(
     else:
         filtered = photos if split else _filter_orientation(photos, orientation)
     if not filtered:
-        return {"error": f"No {orientation} photos in this album.", "url": None}
+        return {"error": f"No {orientation} photos in {where}.", "url": None}
 
     mode = options.get("mode", "random")
     second = None
@@ -930,7 +1037,9 @@ def fetch(
         # One position per set of photos: each frame shape keeps its own.
         seq = f"frame_{shape}" if shape else orientation
         suffix = f"_{seq}" if seq not in ("any", "auto", "frame", "splitview") else ""
-        idx_file = data_dir / f".seq_idx_{_cache_key(link)}{suffix}"
+        # One album keeps its old cursor file; a mix gets one of its own.
+        cursor = _cache_key("\n".join(links))
+        idx_file = data_dir / f".seq_idx_{cursor}{suffix}"
         try:
             current = int(idx_file.read_text(encoding="utf-8"))
         except (FileNotFoundError, ValueError, OSError):
@@ -943,19 +1052,22 @@ def fetch(
     elif split:
         photo, second, index = _pick_split(filtered)
     else:
+        # Uniform over the union: every photo equally likely, whichever
+        # album it is in and however big that album is.
         photo = random.choice(filtered)
         index = filtered.index(photo) + 1
 
     cell = _cell_size(ctx)
     return {
-        "url": _proxy_url(link, photo, cell),
+        "url": _proxy_url(photo["_link"], photo, cell),
         "id": photo.get("id"),
         "date": _iso_date(photo.get("taken_ms")),
-        "stream": manifest.get("album") or "",
+        # The caption names the album this photo is in.
+        "stream": photo["_album"],
         "width": photo.get("width"),
         "height": photo.get("height"),
         "index": index,
         "count": len(filtered),
         # Split view only: a second photo of the same shape as ``url``.
-        "url2": _proxy_url(link, second, cell) if second else None,
+        "url2": _proxy_url(second["_link"], second, cell) if second else None,
     }

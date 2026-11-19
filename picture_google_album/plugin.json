@@ -8,7 +8,7 @@
     "network:photos.google.com",
     "network:lh3.googleusercontent.com"
   ],
-  "description": "Rotates through photos in a Google Photos album shared by link, full bleed. In Google Photos: open the album, Share, 'Create link', then paste the link (https://photos.app.goo.gl/…). Reads the public share page directly, no Google account or API key needed.",
+  "description": "Rotates through photos in a Google Photos album shared by link, full bleed. In Google Photos: open the album, Share, 'Create link', then paste the link (https://photos.app.goo.gl/…). Paste several links, one per line, to mix albums in one cell. Reads the public share page directly, no Google account or API key needed.",
   "icon": "ph-google-photos-logo",
   "supports": {
     "sizes": [
@@ -21,10 +21,10 @@
     {
       "name": "album",
       "placeholder": "https://photos.app.goo.gl/AbCdEfGhijkLmN2p9",
-      "type": "string",
-      "label": "Album link",
+      "type": "textarea",
+      "label": "Shared albums",
       "default": "",
-      "help": "In Google Photos, open the album, choose Share, then Create link. Paste the complete photos.app.goo.gl link or photos.google.com/share/ link, including its query string. Preserve capitals; use plain text."
+      "help": "In Google Photos, open the album, choose Share, then Create link. Paste the complete photos.app.goo.gl link or photos.google.com/share/ link, including its query string. Preserve capitals; use plain text. For several albums, put one link per line; their photos are mixed together and each photo is equally likely."
     },
     {
       "name": "mode",
