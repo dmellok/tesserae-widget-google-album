@@ -49,6 +49,14 @@
       "default": "any",
       "choices": [
         {
+          "value": "auto",
+          "label": "Auto"
+        },
+        {
+          "value": "frame",
+          "label": "Match the frame"
+        },
+        {
           "value": "any",
           "label": "Any"
         },
@@ -69,7 +77,7 @@
           "label": "Split view"
         }
       ],
-      "help": "Only photos of this shape. Split view shows a portrait photo as a pair in a landscape cell, or a landscape photo as a pair in a portrait cell. Square photos and near-square cells are never paired. Split view pairs only with random selection."
+      "help": "Auto shows photos the shape of this cell on each frame when the dashboard is on both portrait and landscape frames, and any photo otherwise. Match the frame always does this, so a portrait cell on a landscape frame shows portrait photos. Both keep square photos, and show the whole album when it has no photo of that shape. Portrait, Landscape and Square show only photos of that shape. Split view shows a portrait photo as a pair in a landscape cell, or a landscape photo as a pair in a portrait cell. Square photos and near-square cells are never paired. Split view pairs only with random selection."
     },
     {
       "name": "scale",

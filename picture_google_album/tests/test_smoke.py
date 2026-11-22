@@ -323,8 +323,16 @@ def test_options_panel_is_short_and_keeps_saved_cells() -> None:
     assert set(by) - set(old) == {"pair_gap", "pair_divider", "pinned_asset"}
     for name, was in old.items():
         o = by[name]
-        assert o["type"] == was["type"] and o.get("default") == was["default"], name
-        assert [c["value"] for c in o.get("choices", [])][: len(was["values"])] == was["values"], name
+        values = [c["value"] for c in o.get("choices", [])]
+        if name == "orientation":
+            # Auto and Match the frame lead the list; the default stays Any, and
+            # every value a saved cell can hold is still there, in order.
+            assert values[:2] == ["auto", "frame"] and o["default"] == "any"
+            values = values[2:]
+        else:
+            assert o.get("default") == was["default"], name
+        assert o["type"] == was["type"], name
+        assert values[: len(was["values"])] == was["values"], name
     assert "—" not in json.dumps(m, ensure_ascii=False)
 
 
@@ -730,3 +738,115 @@ def test_unknown_pin_falls_back_to_normal_rotation(tmp_path, monkeypatch):
     out = server.fetch(opts, {}, ctx={"data_dir": str(tmp_path)})
     assert out["id"] == "id0" and out["index"] == 1 and out["count"] == 3
     assert server.fetch({**opts, "pinned_asset": "  "}, {}, ctx={"data_dir": str(tmp_path)})["index"] == 2
+
+
+# ----- Auto and Match the frame ---------------------------------------
+
+BOTH = ["landscape", "portrait"]
+
+
+def _mixed_album(tmp_path):
+    photos = [_mk("L1", 1600, 900), _mk("P1", 900, 1600), _mk("S1", 1000, 1000)]
+    _cache_album(tmp_path, photos)
+
+
+def _drawn(tmp_path, options, **ctx):
+    """The ids fetch draws over many renders."""
+    ctx = {"data_dir": str(tmp_path), **ctx}
+    return {server.fetch({"album": LINK, **options}, {}, ctx=ctx)["id"] for _ in range(60)}
+
+
+def test_auto_on_mixed_frames_matches_the_cell(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    opts = {"orientation": "auto"}
+    assert _drawn(tmp_path, opts, frame_shapes=BOTH, cell_w=800, cell_h=480) == {"idL1", "idS1"}
+    assert _drawn(tmp_path, opts, frame_shapes=BOTH, cell_w=480, cell_h=800) == {"idP1", "idS1"}
+    # Unknown cell size: the panel's decides.
+    assert _drawn(tmp_path, opts, frame_shapes=BOTH, cell_w=0, cell_h=0, panel_w=480, panel_h=800) == {"idP1", "idS1"}
+    # Square cell: no shape to match.
+    assert _drawn(tmp_path, opts, frame_shapes=BOTH, cell_w=600, cell_h=600) == {"idL1", "idP1", "idS1"}
+
+
+def test_auto_is_any_on_one_frame_shape_or_none(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    everything = {"idL1", "idP1", "idS1"}
+    for opts in ({"orientation": "auto"},):
+        assert _drawn(tmp_path, opts, frame_shapes=["landscape"], cell_w=800, cell_h=480) == everything
+        assert _drawn(tmp_path, opts, cell_w=800, cell_h=480) == everything
+
+
+def test_an_unset_orientation_is_any_in_a_render_and_in_lineups(tmp_path, monkeypatch):
+    """A cell saved before Auto existed keeps showing every photo on a dashboard
+    that is on both frame shapes, and Lineups lists the same set."""
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    everything = {"idL1", "idP1", "idS1"}
+    for w, h in ((800, 480), (480, 800)):
+        assert _drawn(tmp_path, {}, frame_shapes=BOTH, cell_w=w, cell_h=h) == everything
+        ctx = {"data_dir": str(tmp_path), "frame_shapes": BOTH, "cell_w": w, "cell_h": h}
+        assert {i["key"] for i in server.lineup_items({"album": LINK}, ctx=ctx)} == everything
+
+
+def test_match_the_frame_filters_on_any_frame(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    opts = {"orientation": "frame"}
+    assert _drawn(tmp_path, opts, cell_w=800, cell_h=480) == {"idL1", "idS1"}
+    assert _drawn(tmp_path, opts, frame_shapes=["portrait"], cell_w=480, cell_h=800) == {"idP1", "idS1"}
+    out = server.fetch({"album": LINK, **opts}, {}, ctx={"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480})
+    assert out["count"] == 2
+
+
+def test_match_the_frame_falls_back_to_the_whole_album(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_album(tmp_path, [_mk("P1", 900, 1600), _mk("P2", 900, 1600)])
+    for orientation in ("frame", "auto"):
+        ctx = {"data_dir": str(tmp_path), "frame_shapes": BOTH, "cell_w": 800, "cell_h": 480}
+        out = server.fetch({"album": LINK, "orientation": orientation}, {}, ctx=ctx)
+        assert "error" not in out and out["count"] == 2
+
+
+def test_match_the_frame_keeps_a_sequence_per_frame_shape(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _cache_album(tmp_path, [_mk("L1", 1600, 900), _mk("P1", 900, 1600), _mk("L2", 1600, 900)])
+    wide = {"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480}
+    tall = {**wide, "cell_w": 480, "cell_h": 800}
+    opts = {"album": LINK, "orientation": "frame", "mode": "sequential"}
+    ids = [server.fetch(opts, {}, ctx=c)["id"] for c in (wide, tall, wide, tall)]
+    assert ids == ["idL1", "idP1", "idL2", "idP1"]
+
+
+def test_split_view_is_unchanged_by_frame_shapes(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    ctx = {"frame_shapes": BOTH, "cell_w": 800, "cell_h": 480}
+    assert _drawn(tmp_path, {"orientation": "splitview"}, **ctx) == {"idL1", "idP1", "idS1"}
+
+
+def test_lineups_list_only_what_each_frame_is_shown(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    wide = {"data_dir": str(tmp_path), "frame_shapes": BOTH, "cell_w": 800, "cell_h": 480}
+    tall = {**wide, "cell_w": 480, "cell_h": 800}
+    for orientation in ("auto", "frame"):
+        opts = {"album": LINK, "orientation": orientation}
+        assert [i["key"] for i in server.lineup_items(opts, ctx=wide)] == ["idL1", "idS1"]
+        assert [i["key"] for i in server.lineup_items(opts, ctx=tall)] == ["idP1", "idS1"]
+        assert server.lineup_item_count(opts, ctx=wide) == 2
+    # Any, and a cell that saved no orientation (the default, Any): everything.
+    for orientation in ("any", None):
+        any_opts = {"album": LINK, "orientation": orientation}
+        assert server.lineup_item_count(any_opts, ctx=wide) == 3
+        assert server.lineup_item_count(any_opts, ctx=tall) == 3
+    one_shape = {**wide, "frame_shapes": ["landscape"]}
+    assert server.lineup_item_count({"album": LINK, "orientation": "auto"}, ctx=one_shape) == 3
+
+
+def test_pinned_photo_ignores_match_the_frame(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    ctx = {"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480}
+    out = server.fetch({"album": LINK, "orientation": "frame", "pinned_asset": "idP1"}, {}, ctx=ctx)
+    assert out["id"] == "idP1"
