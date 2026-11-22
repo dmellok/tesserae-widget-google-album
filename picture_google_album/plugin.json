@@ -24,7 +24,7 @@
       "type": "textarea",
       "label": "Shared albums",
       "default": "",
-      "help": "In Google Photos, open the album, choose Share, then Create link. Paste the complete photos.app.goo.gl link or photos.google.com/share/ link, including its query string. Preserve capitals; use plain text. For several albums, put one link per line; their photos are mixed together and each photo is equally likely."
+      "help": "In Google Photos, open the album, choose Share, then Create link. Paste the complete photos.app.goo.gl link or photos.google.com/share/ link, including its query string. Preserve capitals; use plain text. For several albums (up to 10), put one link per line; their photos are mixed together and each photo is equally likely."
     },
     {
       "name": "mode",

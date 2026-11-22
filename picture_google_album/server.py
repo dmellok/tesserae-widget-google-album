@@ -22,7 +22,11 @@ Several links (one per line, or separated by commas or spaces) mix those
 albums in one cell. Each album keeps its own manifest cache; the cell draws
 from their union, with a photo found in two albums counted once, so every
 photo is equally likely. Sequential walks the albums in the order listed.
-An album that fails to load is left out while the others still show.
+A cell takes at most MAX_ALBUMS links. An album whose refresh fails keeps
+showing from its last manifest; one that has never loaded is left out while
+the others still show, and the result says how many were left out
+(``albums_skipped``, ``albums_skipped_reason``). A link that failed is not
+asked for again for FAILURE_TTL_S.
 
 Videos in the album are listed on the same page with an lh3 poster-frame
 URL; they are detected by the video-info key in each entry's trailing
@@ -82,7 +86,7 @@ MANIFEST_TTL_S = 6 * 3600
 # older schema are refetched rather than trusted (e.g. pre-``is_video``
 # caches would let video stills through the filter for up to the TTL,
 # and pre-pagination caches would pin big albums at the first 300).
-MANIFEST_SCHEMA = 3
+MANIFEST_SCHEMA = 4
 # Google embeds ~300 items per page; 20 pages ≈ 6,000 photos.
 MAX_ALBUM_PAGES = 20
 BATCHEXECUTE_URL = "https://photos.google.com/_/PhotosUi/data/batchexecute"
@@ -128,6 +132,15 @@ DATA_CALLBACK_RE = re.compile(
 # so a malformed page can't make us scan to EOF per entry.
 ENTRY_SCAN_CAP = 100_000
 DEDUP_KEY_RE = re.compile(r"^[\w-]{20,64}$")
+# The same hash in the raw page text, right after an entry's timestamp (where
+# PHOTO_RE stops), for the regex fallback parser.
+DEDUP_AFTER_RE = re.compile(r',"([\w-]{20,64})"')
+# A cell mixes at most this many albums: each is a page of several MB plus
+# its pagination calls, and all of them refresh together.
+MAX_ALBUMS = 10
+# How long a link that failed to load is left alone before Google is asked
+# again, so a dead link is not requested on every render.
+FAILURE_TTL_S = 300
 # At most this many albums of one cell load from Google at once.
 ALBUM_LOAD_WORKERS = 4
 
@@ -214,16 +227,20 @@ def _parse_photos(page: str) -> list[dict[str, Any]]:
         if url in seen:
             continue
         seen.add(url)
-        photos.append(
-            {
-                "id": pid,
-                "base": url,
-                "width": int(w),
-                "height": int(h),
-                "taken_ms": int(ts),
-                "is_video": VIDEO_KEY in _entry_extent(page, m.start()),
-            }
-        )
+        photo = {
+            "id": pid,
+            "base": url,
+            "width": int(w),
+            "height": int(h),
+            "taken_ms": int(ts),
+            "is_video": VIDEO_KEY in _entry_extent(page, m.start()),
+        }
+        # The file's content hash follows the timestamp (see
+        # ``_photo_from_entry``); a mix of albums counts a photo once by it.
+        dedup = DEDUP_AFTER_RE.match(page, m.end())
+        if dedup:
+            photo["dedup_key"] = dedup.group(1)
+        photos.append(photo)
     if photos:
         return photos
     # Older/alternate page shapes: fall back to bare url triples.
@@ -415,22 +432,55 @@ def _write_cache(path: Path, payload: dict[str, Any]) -> None:
         path.write_text(json.dumps(payload), encoding="utf-8")
 
 
+# (data_dir, link) -> (when it failed, the error). In memory: a restart asks
+# Google again.
+_FAILED: dict[tuple[str, str], tuple[float, str]] = {}
+
+
+def _stale_manifest(cache_path: Path) -> dict[str, Any] | None:
+    """The cached manifest whatever its age, when it has the current shape
+    (the photo route reads no other)."""
+    try:
+        cached = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(cached, dict) and cached.get("schema") == MANIFEST_SCHEMA:
+        return cached
+    return None
+
+
 def _load_manifest(
-    link: str, data_dir: Path
+    link: str, data_dir: Path, *, retry: bool = False
 ) -> tuple[dict[str, Any] | None, str | None]:
+    """``(manifest, error)`` for one album. A cached manifest under 6 hours
+    old is used as it is. When a refresh fails, the old manifest (if there is
+    one) comes back together with the error, so the album keeps showing; with
+    none, the manifest is None. A failed link is not asked for again for
+    FAILURE_TTL_S unless ``retry`` is set."""
     cache_path = data_dir / f"manifest_{_cache_key(link)}.json"
     cached = _read_cache(cache_path, MANIFEST_TTL_S)
     if cached is not None and cached.get("schema") == MANIFEST_SCHEMA:
         return cached, None
+    failure_key = (str(data_dir), link)
+    failed = _FAILED.get(failure_key)
+    if failed and not retry and 0 <= time.time() - failed[0] < FAILURE_TTL_S:
+        return _stale_manifest(cache_path), failed[1]
     page, final_url, err = _get_page(link)
+    photos: list[dict[str, Any]] = []
+    title = ""
+    if not err:
+        photos, title = _photos_from_page(page, final_url)
+        if not photos:
+            err = (
+                "No photos found at that link. Make sure the album is shared "
+                "with 'Create link' in Google Photos and the link is public."
+            )
     if err:
-        return None, err
-    photos, title = _photos_from_page(page, final_url)
-    if not photos:
-        return None, (
-            "No photos found at that link. Make sure the album is shared "
-            "with 'Create link' in Google Photos and the link is public."
-        )
+        if len(_FAILED) > 256:
+            _FAILED.clear()
+        _FAILED[failure_key] = (time.time(), err)
+        return _stale_manifest(cache_path), err
+    _FAILED.pop(failure_key, None)
     manifest = {
         "schema": MANIFEST_SCHEMA,
         "album": title or _parse_title(page),
@@ -442,19 +492,22 @@ def _load_manifest(
 
 
 def _load_albums(
-    links: list[str], data_dir: Path
-) -> tuple[list[tuple[str, dict[str, Any]]], str | None]:
-    """(link, manifest) for every album that loaded, in link order, and the
-    first album's error when one failed. Several albums load side by side,
-    each in a copy of this call's context so the host's network allowlist
-    applies in the worker too."""
+    links: list[str], data_dir: Path, *, retry: bool = False
+) -> tuple[list[tuple[str, dict[str, Any]]], int, str | None]:
+    """``(albums, skipped, error)``: (link, manifest) for every album there
+    is a manifest for, in link order; how many albums were left out because
+    they would not load and had no earlier manifest to fall back on; and the
+    first of those albums' errors. An album whose refresh failed but which has
+    an old manifest is shown from that and is not counted as skipped. Several
+    albums load side by side, each in a copy of this call's context so the
+    host's network allowlist applies in the worker too."""
     if len(links) == 1:
-        results = [_load_manifest(links[0], data_dir)]
+        results = [_load_manifest(links[0], data_dir, retry=retry)]
     else:
 
         def load(link: str) -> tuple[dict[str, Any] | None, str | None]:
             try:
-                return _load_manifest(link, data_dir)
+                return _load_manifest(link, data_dir, retry=retry)
             except Exception as err:  # one bad album must not sink the rest
                 return None, f"Could not load the album: {err}"[:200]
 
@@ -466,8 +519,8 @@ def _load_albums(
             ]
             results = [f.result() for f in futures]
     albums = [(link, m) for link, (m, _) in zip(links, results) if m is not None]
-    err = next((e for _, e in results if e), None)
-    return albums, err
+    missing = [e for m, e in results if m is None]
+    return albums, len(missing), next((e for e in missing if e), None)
 
 
 def _union(albums: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -920,7 +973,7 @@ def _start_lineup_load(
 def _lineup_photos(options: dict[str, Any], ctx: dict[str, Any] | None) -> list[dict[str, Any]]:
     links = _share_urls(options.get("album"))
     data_dir = (ctx or {}).get("data_dir")
-    if not links or not data_dir:
+    if not links or not data_dir or len(links) > MAX_ALBUMS:
         return []
     albums = _lineup_manifests(links, Path(str(data_dir)))
     if not albums:
@@ -979,12 +1032,24 @@ def fetch(
             "url": None,
         }
 
+    if len(links) > MAX_ALBUMS:
+        return {
+            "error": f"This cell lists {len(links)} albums; it can mix at most "
+            f"{MAX_ALBUMS}. Remove some links in the cell editor.",
+            "url": None,
+        }
+
     data_dir = Path(ctx.get("data_dir") or ".")
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    albums, err = _load_albums(links, data_dir)
+    albums, skipped, err = _load_albums(links, data_dir, retry=bool(ctx.get("fresh")))
     if not albums:
         return {"error": err or "Could not load the album.", "url": None}
+    # Albums left out of this render, for the cell or the editor to mention.
+    left_out = {
+        "albums_skipped": skipped,
+        "albums_skipped_reason": (err or "Could not load the album.") if skipped else None,
+    }
     where = "this album" if len(links) == 1 else "these albums"
 
     photos = _union(albums)
@@ -1006,6 +1071,7 @@ def fetch(
             "index": shown + 1,
             "count": len(pool),
             "url2": None,
+            **left_out,
         }
     if not options.get("include_videos"):
         stills = [p for p in photos if not p.get("is_video")]
@@ -1070,4 +1136,5 @@ def fetch(
         "count": len(filtered),
         # Split view only: a second photo of the same shape as ``url``.
         "url2": _proxy_url(second["_link"], second, cell) if second else None,
+        **left_out,
     }

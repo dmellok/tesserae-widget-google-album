@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import server
 
@@ -976,3 +977,120 @@ def test_pinned_photo_ignores_match_the_frame(tmp_path, monkeypatch):
     ctx = {"data_dir": str(tmp_path), "cell_w": 800, "cell_h": 480}
     out = server.fetch({"album": LINK, "orientation": "frame", "pinned_asset": "idP1"}, {}, ctx=ctx)
     assert out["id"] == "idP1"
+
+
+# ----- albums that will not load, and the cap ---------------------------
+
+
+def _counting_failure(monkeypatch, message="Google returned HTTP 404 for the share link."):
+    calls = []
+
+    def get_page(url):
+        calls.append(url)
+        return "", "", message
+
+    monkeypatch.setattr(server, "_get_page", get_page)
+    return calls
+
+
+def _age(tmp_path, link, seconds):
+    path = tmp_path / f"manifest_{server._cache_key(link)}.json"
+    then = time.time() - seconds
+    os.utime(path, (then, then))
+
+
+def test_a_failed_refresh_falls_back_to_the_old_manifest(tmp_path, monkeypatch):
+    calls = _counting_failure(monkeypatch, "Could not reach Google Photos: offline")
+    _cache_named(tmp_path, LINK_A, "Alpha", [_mk("A1", 1600, 1200)])
+    _cache_named(tmp_path, LINK_B, "Beta", [_mk("B1", 1600, 1200)])
+    _age(tmp_path, LINK_B, server.MANIFEST_TTL_S + 60)
+    ctx = {"data_dir": str(tmp_path)}
+    seen = {server.fetch({"album": f"{LINK_A}\n{LINK_B}"}, {}, ctx=ctx)["id"] for _ in range(40)}
+    assert seen == {"idA1", "idB1"}  # the stale album still shows
+    out = server.fetch({"album": f"{LINK_A}\n{LINK_B}"}, {}, ctx=ctx)
+    assert out["albums_skipped"] == 0 and out["albums_skipped_reason"] is None
+    assert calls == [LINK_B]  # asked once, then left alone
+    # A single album too: the old photos rather than an error.
+    alone = server.fetch({"album": LINK_B}, {}, ctx=ctx)
+    assert alone["id"] == "idB1" and "error" not in alone
+
+
+def test_skipped_albums_are_reported_in_the_result(tmp_path, monkeypatch):
+    _counting_failure(monkeypatch)
+    _cache_named(tmp_path, LINK_A, "Alpha", [_mk("A1", 1600, 1200)])
+    ctx = {"data_dir": str(tmp_path)}
+    gone = "https://photos.app.goo.gl/Gone"
+    out = server.fetch({"album": f"{LINK_A}\n{LINK_B}\n{gone}"}, {}, ctx=ctx)
+    assert out["id"] == "idA1"
+    assert out["albums_skipped"] == 2
+    assert "HTTP 404" in out["albums_skipped_reason"]
+    pinned = server.fetch(
+        {"album": f"{LINK_A}\n{LINK_B}", "pinned_asset": "idA1"}, {}, ctx=ctx
+    )
+    assert pinned["id"] == "idA1" and pinned["albums_skipped"] == 1
+    fine = server.fetch({"album": LINK_A}, {}, ctx=ctx)
+    assert fine["albums_skipped"] == 0 and fine["albums_skipped_reason"] is None
+
+
+def test_a_dead_link_is_not_requested_on_every_render(tmp_path, monkeypatch):
+    calls = _counting_failure(monkeypatch)
+    _cache_named(tmp_path, LINK_A, "Alpha", [_mk("A1", 1600, 1200)])
+    ctx = {"data_dir": str(tmp_path)}
+    opts = {"album": f"{LINK_A}\n{LINK_B}"}
+    for _ in range(5):
+        assert server.fetch(opts, {}, ctx=ctx)["albums_skipped"] == 1
+    assert calls == [LINK_B]
+    # A fresh render asks again.
+    server.fetch(opts, {}, ctx={**ctx, "fresh": True})
+    assert calls == [LINK_B, LINK_B]
+    # So does a render once the wait is over.
+    monkeypatch.setattr(server, "FAILURE_TTL_S", 0)
+    server.fetch(opts, {}, ctx=ctx)
+    assert calls == [LINK_B, LINK_B, LINK_B]
+
+
+def test_a_link_that_loads_again_is_no_longer_held_back(tmp_path, monkeypatch):
+    _counting_failure(monkeypatch)
+    ctx = {"data_dir": str(tmp_path)}
+    assert server.fetch({"album": LINK_B}, {}, ctx=ctx)["url"] is None
+    monkeypatch.setattr(server, "_get_page", lambda url: (SAMPLE_PAGE, url, None))
+    held = server.fetch({"album": LINK_B}, {}, ctx=ctx)
+    assert held["url"] is None and "HTTP 404" in held["error"]
+    again = server.fetch({"album": LINK_B}, {}, ctx={**ctx, "fresh": True})
+    assert again["url"] and (str(tmp_path), LINK_B) not in server._FAILED
+
+
+def test_an_old_schema_manifest_is_read_afresh_and_is_no_fallback(tmp_path, monkeypatch):
+    assert server.MANIFEST_SCHEMA == 4  # photos gained dedup_key
+    old = {"schema": 3, "album": "Old", "photos": [_mk("O1", 1600, 1200)], "fetched_at": 0}
+    server._write_cache(tmp_path / f"manifest_{server._cache_key(LINK_A)}.json", old)
+    calls = _counting_failure(monkeypatch)
+    out = server.fetch({"album": LINK_A}, {}, ctx={"data_dir": str(tmp_path)})
+    assert calls == [LINK_A] and out["url"] is None
+
+
+def test_the_regex_fallback_keeps_the_content_hash():
+    page = (
+        '[["AF1QipPY5sWHzRcBbIjsO4oAJveQm2AFvxA8o_sbf2Jo",'
+        '["https://lh3.googleusercontent.com/pw/AP1GczN3REph",4032,2268,'
+        "null,null,null,null,null,[null,null,1],[9073751]],"
+        '1735427730483,"T1TGVJ9_fE_p-Bv0MvMfSVrnW-Q",39600000]]'
+    )
+    assert server._parse_photos(page)[0]["dedup_key"] == "T1TGVJ9_fE_p-Bv0MvMfSVrnW-Q"
+    # No hash after the timestamp (or one too short to be a hash): no key.
+    assert all("dedup_key" not in p for p in server._parse_photos(SAMPLE_PAGE))
+
+
+def test_a_cell_mixes_at_most_ten_albums(tmp_path, monkeypatch):
+    _no_network(monkeypatch)
+    links = [f"https://photos.app.goo.gl/Album{n}" for n in range(11)]
+    for link in links:
+        _cache_named(tmp_path, link, "T", [_mk(link[-2:], 1600, 1200)])
+    ctx = {"data_dir": str(tmp_path)}
+    over = server.fetch({"album": "\n".join(links)}, {}, ctx=ctx)
+    assert over["url"] is None
+    assert "11 albums" in over["error"] and "at most 10" in over["error"]
+    assert server.lineup_items({"album": "\n".join(links)}, ctx=ctx) == []
+    # Ten is fine, and a repeated link does not count twice.
+    ten = server.fetch({"album": "\n".join(links[:10] + links[:1])}, {}, ctx=ctx)
+    assert ten["url"] and ten["count"] == 10
