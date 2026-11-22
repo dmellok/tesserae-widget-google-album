@@ -847,11 +847,11 @@ def _candidates(
     """The photos the widget draws from under these options on this frame:
     videos only when asked for, then the orientation filter (split view takes
     them all; Auto and Match the frame use ``ctx``'s cell size and frame
-    shapes, as a render does). Unset reads as the default, Auto: a render gets
-    it filled in, a Lineups listing reads the saved options as they are."""
+    shapes, as a render does). Unset reads as the default, Any, as in fetch:
+    a Lineups listing reads the saved options without the manifest defaults."""
     if not options.get("include_videos"):
         photos = [p for p in photos if not p.get("is_video")]
-    orientation = (options.get("orientation") or "auto").lower()
+    orientation = (options.get("orientation") or "any").lower()
     shape = _frame_shape(orientation, ctx or {})
     if shape:
         return _match_frame(photos, shape)

@@ -325,9 +325,9 @@ def test_options_panel_is_short_and_keeps_saved_cells() -> None:
         o = by[name]
         values = [c["value"] for c in o.get("choices", [])]
         if name == "orientation":
-            # Auto and Match the frame lead the list and Auto is the new default;
+            # Auto and Match the frame lead the list; the default stays Any, and
             # every value a saved cell can hold is still there, in order.
-            assert values[:2] == ["auto", "frame"] and o["default"] == "auto"
+            assert values[:2] == ["auto", "frame"] and o["default"] == "any"
             values = values[2:]
         else:
             assert o.get("default") == was["default"], name
@@ -898,9 +898,21 @@ def test_auto_is_any_on_one_frame_shape_or_none(tmp_path, monkeypatch):
     _no_network(monkeypatch)
     _mixed_album(tmp_path)
     everything = {"idL1", "idP1", "idS1"}
-    for opts in ({"orientation": "auto"}, {}):  # Auto is the default
+    for opts in ({"orientation": "auto"},):
         assert _drawn(tmp_path, opts, frame_shapes=["landscape"], cell_w=800, cell_h=480) == everything
         assert _drawn(tmp_path, opts, cell_w=800, cell_h=480) == everything
+
+
+def test_an_unset_orientation_is_any_in_a_render_and_in_lineups(tmp_path, monkeypatch):
+    """A cell saved before Auto existed keeps showing every photo on a dashboard
+    that is on both frame shapes, and Lineups lists the same set."""
+    _no_network(monkeypatch)
+    _mixed_album(tmp_path)
+    everything = {"idL1", "idP1", "idS1"}
+    for w, h in ((800, 480), (480, 800)):
+        assert _drawn(tmp_path, {}, frame_shapes=BOTH, cell_w=w, cell_h=h) == everything
+        ctx = {"data_dir": str(tmp_path), "frame_shapes": BOTH, "cell_w": w, "cell_h": h}
+        assert {i["key"] for i in server.lineup_items({"album": LINK}, ctx=ctx)} == everything
 
 
 def test_match_the_frame_filters_on_any_frame(tmp_path, monkeypatch):
@@ -944,13 +956,16 @@ def test_lineups_list_only_what_each_frame_is_shown(tmp_path, monkeypatch):
     _mixed_album(tmp_path)
     wide = {"data_dir": str(tmp_path), "frame_shapes": BOTH, "cell_w": 800, "cell_h": 480}
     tall = {**wide, "cell_w": 480, "cell_h": 800}
-    for orientation in ("auto", "frame", None):  # None: a cell that saved no orientation
+    for orientation in ("auto", "frame"):
         opts = {"album": LINK, "orientation": orientation}
         assert [i["key"] for i in server.lineup_items(opts, ctx=wide)] == ["idL1", "idS1"]
         assert [i["key"] for i in server.lineup_items(opts, ctx=tall)] == ["idP1", "idS1"]
         assert server.lineup_item_count(opts, ctx=wide) == 2
-    any_opts = {"album": LINK, "orientation": "any"}
-    assert server.lineup_item_count(any_opts, ctx=wide) == 3
+    # Any, and a cell that saved no orientation (the default, Any): everything.
+    for orientation in ("any", None):
+        any_opts = {"album": LINK, "orientation": orientation}
+        assert server.lineup_item_count(any_opts, ctx=wide) == 3
+        assert server.lineup_item_count(any_opts, ctx=tall) == 3
     one_shape = {**wide, "frame_shapes": ["landscape"]}
     assert server.lineup_item_count({"album": LINK, "orientation": "auto"}, ctx=one_shape) == 3
 
